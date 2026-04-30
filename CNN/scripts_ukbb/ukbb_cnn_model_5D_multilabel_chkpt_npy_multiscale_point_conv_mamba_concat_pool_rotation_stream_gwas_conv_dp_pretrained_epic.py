@@ -20,6 +20,8 @@ import csv
 import time
 import shutil
 import torch.nn.functional as F
+from transfer_learning_epic_to_ukbb import load_ukbb_model_with_epic_weights
+
 #from ukbb_dataloader_with_rotation import prepare_data_splits, create_dataloaders, create_dataloaders_with_rotation
 
 # Try to import mamba-ssm, fallback to custom implementation if not available
@@ -166,7 +168,11 @@ def parse_args():
     parser.add_argument("-gwas_disease_filter", type=str, default=None,
                         help="Disease for GWAS SNP filtering (only used when dataloader_type='gwas'). Options: t2d, prostate, breast, colon, pancreatic, or None for no filtering")
     
-
+    # Transfer learning from EPIC
+    parser.add_argument("-epic_checkpoint", type=str, default=None, help="Path to EPIC pre-trained model checkpoint for transfer learning")
+    parser.add_argument("-freeze_conv_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze conv layers after EPIC transfer (0: no, 1: yes)")
+    parser.add_argument("-freeze_mamba_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze Mamba layers after EPIC transfer (0: no, 1: yes)")
+    
     return parser.parse_args()
 
 def calculate_class_weights(phenotype_data, train_subjects, disease_labels, device):
@@ -3032,6 +3038,24 @@ def main():
 
     model = model.to(device)
     print("Model created and moved to device")
+
+    # Load EPIC pre-trained weights if provided
+    if args.epic_checkpoint:
+        print("\n" + "="*80)
+        print("LOADING EPIC PRE-TRAINED WEIGHTS")
+        print("="*80)
+        
+        if not os.path.exists(args.epic_checkpoint):
+            raise FileNotFoundError(f"EPIC checkpoint not found: {args.epic_checkpoint}")
+        
+        model = load_ukbb_model_with_epic_weights(
+            ukbb_model=model,
+            epic_checkpoint_path=args.epic_checkpoint,
+            freeze_conv=bool(args.freeze_conv_layers),
+            freeze_mamba=bool(args.freeze_mamba_layers)
+        )
+    else:
+        print("No EPIC checkpoint provided. Training from random initialization.")
     
     with open(os.path.join(experiment_dir, 'model_architecture.txt'), 'w') as file:
         file.write(str(model))
