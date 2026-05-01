@@ -14,6 +14,7 @@ New Features:
 """
 
 import os
+import pickle
 import pandas as pd
 import torch
 import numpy as np
@@ -67,8 +68,8 @@ def load_prefiltered_indices(chr_num, base_path=BASE_PATH, rank=0):
     txt_file = os.path.join(chr_dir, f"chr{chr_num}_filtered_indices_epic.txt")
     
     if os.path.exists(npy_file):
-        if rank == 0:
-            print(f"  Loading prefiltered indices for chr{chr_num} (fast load!)")
+        #if rank == 0:
+            #print(f"  Loading prefiltered indices for chr{chr_num} (fast load!)")
         indices = np.load(npy_file)
         _PREFILTERED_INDICES_CACHE[cache_key] = indices
         if rank == 0:
@@ -170,40 +171,55 @@ def get_sample_files_for_subject(id1, id2):
     return sample_files
 
 
-def discover_all_subjects():
+def discover_all_subjects(phenotype_subjects=None, use_cache=True):
     """
-    Discover all subjects that have complete data across all 22 chromosomes
-    
-    Returns:
-        List of tuples: [(id1, id2), ...]
+    Discover subjects that have genotype data AND are in the phenotype file.
+
+    Single glob on chr1, then intersect with phenotype_subjects (the small set)
+    — O(n_phenotype) instead of 22 × N os.path.exists calls.
+    Results are pickled so subsequent runs are instant.
+
+    Args:
+        phenotype_subjects: Set of (id1, id2) string tuples from the phenotype file.
+        use_cache: Load from / save to a pickle cache (default True).
     """
+    cache_file = os.path.join(BASE_PATH, "discovered_subjects_cache.pkl")
+
+    if use_cache and os.path.exists(cache_file):
+        print(f"Loading subject list from cache: {cache_file}")
+        with open(cache_file, "rb") as f:
+            subjects = pickle.load(f)
+        print(f"Loaded {len(subjects)} subjects from cache")
+        return subjects
+
     print("Discovering subjects with complete chromosome data...")
-    
-    # Start by scanning chr1 directory to get list of subjects
-    chr1_dir = os.path.join(BASE_PATH, "chr1")
-    chr1_files = glob.glob(os.path.join(chr1_dir, "sample_*_chr1.npy"))
-    
-    print(f"Found {len(chr1_files)} files in chr1 directory")
-    
-    subjects_with_complete_data = []
-    
-    for chr1_file in chr1_files:
-        # Extract ID_1 and ID_2 from filename
-        basename = os.path.basename(chr1_file)
-        # Format: sample_ID1_ID2_chr1.npy
+
+    chr1_pattern = os.path.join(BASE_PATH, "chr1", "sample_*_chr1.npy")
+    chr1_keys = set()
+    for f in glob.glob(chr1_pattern):
+        basename = os.path.basename(f)
         parts = basename.replace("sample_", "").replace("_chr1.npy", "").split("_")
-        
         if len(parts) == 2:
-            id1, id2 = parts[0], parts[1]
-            
-            # Check if all 22 chromosomes exist for this subject
-            sample_files = get_sample_files_for_subject(id1, id2)
-            
-            if sample_files is not None:
-                subjects_with_complete_data.append((id1, id2))
-    
-    print(f"Found {len(subjects_with_complete_data)} subjects with complete data (all 22 chromosomes)")
-    return subjects_with_complete_data
+            chr1_keys.add((parts[0], parts[1]))
+
+    print(f"Found {len(chr1_keys)} files in chr1 directory")
+
+    if phenotype_subjects is not None:
+        chr1_keys = phenotype_subjects & chr1_keys
+        print(f"After phenotype filter: {len(chr1_keys)} subjects")
+
+    subjects = sorted(chr1_keys)
+    print(f"Found {len(subjects)} subjects with complete data (all 22 chromosomes)")
+
+    if use_cache:
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(subjects, f)
+            print(f"Subject list cached to: {cache_file}")
+        except Exception as e:
+            print(f"Warning: could not write subject cache ({e})")
+
+    return subjects
 
 
 def load_genotype_data_for_subject(id1, id2, return_shapes=False, apply_snp_filter=True, rank=0):
@@ -674,7 +690,9 @@ def prepare_data_splits(disease_labels,
                         test_size=0.2,
                         random_state=42,
                         rank=0,
-                        use_rotation=False):
+                        use_rotation=False,
+                        max_subjects=None,
+                        use_subject_cache=True):
     """
     Prepare train/test splits for the dataset
 
@@ -726,77 +744,80 @@ def prepare_data_splits(disease_labels,
                     print(f"  Filling NaNs with {fill_value}")
                 phenotype_data[column] = phenotype_data[column].fillna(fill_value)
     
-    # Discover all subjects with complete chromosome data (silently on non-rank-0)
+    # Build (id1, id2) pairs from phenotype file — passed to discover_all_subjects
+    # so intersection is O(n_phenotype) not O(n_chr1).
+    phenotype_subjects = set(
+        zip(phenotype_data['ID_1'].astype(str), phenotype_data['ID_2'].astype(str))
+    )
+
+    # Discover subjects (silently on non-rank-0)
     if rank == 0:
-        all_subjects = discover_all_subjects()
+        filtered_subjects = discover_all_subjects(
+            phenotype_subjects=phenotype_subjects, use_cache=use_subject_cache)
     else:
-        import sys, os
+        import sys
         old_stdout = sys.stdout
         sys.stdout = open(os.devnull, 'w')
         try:
-            all_subjects = discover_all_subjects()
+            filtered_subjects = discover_all_subjects(
+                phenotype_subjects=phenotype_subjects, use_cache=use_subject_cache)
         finally:
             sys.stdout = old_stdout
-    
-    if len(all_subjects) == 0:
-        raise ValueError("No subjects found with complete chromosome data!")
-    
-    # Filter subjects to only those present in phenotype data
-    phenotype_ids = set(phenotype_data['ID_1'].astype(str).unique())
-    
-    filtered_subjects = []
-    for id1, id2 in all_subjects:
-        if str(id1) in phenotype_ids:
-            filtered_subjects.append((id1, id2))
-    
+
     if rank == 0:
         print(f"\nSubjects with both genotype and phenotype data: {len(filtered_subjects)}")
-    
+
     if len(filtered_subjects) == 0:
         raise ValueError("No subjects have both genotype and phenotype data!")
-    
-    # Get input size from first subject
-    first_subject = filtered_subjects[0]
-    if rank == 0:
-        input_size = get_input_size_from_subject(first_subject[0], first_subject[1])
-    else:
-        # Non-rank-0: compute silently
-        genotype_data = load_genotype_data_for_subject(first_subject[0], first_subject[1])
-        input_size = genotype_data.shape[0]
 
-    # STRATIFICATION LOGIC
+    # Debug mode: cap subject count for fast iteration
+    if max_subjects is not None and max_subjects < len(filtered_subjects):
+        if rank == 0:
+            print(f"\n[DEBUG] max_subjects={max_subjects}: truncating from {len(filtered_subjects)} subjects")
+        filtered_subjects = filtered_subjects[:max_subjects]
+
+    # Get input size from first subject (cached to avoid loading 22 chr files)
+    input_size_cache_file = os.path.join(BASE_PATH, "input_size_cache_epic.pkl")
+    if use_subject_cache and os.path.exists(input_size_cache_file):
+        with open(input_size_cache_file, "rb") as f:
+            input_size = pickle.load(f)
+        if rank == 0:
+            print(f"Input size loaded from cache: {input_size:,}")
+    else:
+        first_subject = filtered_subjects[0]
+        if rank == 0:
+            input_size = get_input_size_from_subject(first_subject[0], first_subject[1])
+        else:
+            genotype_data = load_genotype_data_for_subject(first_subject[0], first_subject[1])
+            input_size = genotype_data.shape[0]
+        try:
+            with open(input_size_cache_file, "wb") as f:
+                pickle.dump(input_size, f)
+        except Exception as e:
+            if rank == 0:
+                print(f"Warning: could not cache input size ({e})")
+
+    # STRATIFICATION LOGIC — vectorized merge instead of per-subject .loc loop
     is_multilabel = len(disease_labels) > 1
     stratify_labels = None
 
     if not use_rotation:
-        stratify_labels = []
+        pheno_copy = phenotype_data.copy()
+        pheno_copy['_key'] = pheno_copy['ID_1'].astype(str) + '_' + pheno_copy['ID_2'].astype(str)
 
-        for id1, id2 in filtered_subjects:
-            pheno = phenotype_data.loc[
-                (phenotype_data["ID_1"].astype(str) == str(id1)) &
-                (phenotype_data["ID_2"].astype(str) == str(id2))
-            ]
+        subj_df = pd.DataFrame(filtered_subjects, columns=['ID_1', 'ID_2'])
+        subj_df['_key'] = subj_df['ID_1'].astype(str) + '_' + subj_df['ID_2'].astype(str)
 
-            if len(pheno) == 0:
-                stratify_labels.append(0)
-                continue
+        merged = subj_df.merge(pheno_copy[['_key'] + disease_labels], on='_key', how='left')
 
-            if is_multilabel:
-                # CASE vs CONTROL
-                disease_sum = pheno[disease_labels].values.sum()
-                stratify_labels.append(int(disease_sum > 0))
-            else:
-                # SINGLE LABEL
-                stratify_labels.append(int(pheno[disease_labels[0]].values[0]))
-
-        stratify_labels = np.asarray(stratify_labels)
+        if is_multilabel:
+            stratify_labels = (merged[disease_labels].fillna(0).sum(axis=1) > 0).astype(int).values
+        else:
+            stratify_labels = merged[disease_labels[0]].fillna(0).astype(int).values
 
         if rank == 0:
             print("\nStratified split enabled:")
-            print(
-                "  Mode:",
-                "multi-label (case/control)" if is_multilabel else "single-label"
-            )
+            print("  Mode:", "multi-label (case/control)" if is_multilabel else "single-label")
             print(f"  Positive rate: {stratify_labels.mean():.4f}")
 
     # Split subjects into train/test
@@ -808,9 +829,9 @@ def prepare_data_splits(disease_labels,
     )
 
     if rank == 0 and stratify_labels is not None:
+        subj_to_idx = {s: i for i, s in enumerate(filtered_subjects)}
         def rate(subs):
-            idx = [filtered_subjects.index(s) for s in subs]
-            return stratify_labels[idx].mean()
+            return stratify_labels[[subj_to_idx[s] for s in subs]].mean()
 
         print(f"\nCase/positive rate check:")
         print(f"  Train: {rate(train_subjects):.4f}")

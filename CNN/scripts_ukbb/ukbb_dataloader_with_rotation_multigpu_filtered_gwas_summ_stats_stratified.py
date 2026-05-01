@@ -765,7 +765,7 @@ def prepare_data_splits(disease_labels,
     if rank == 0:
         all_subjects = discover_all_subjects(base_path)
     else:
-        import sys, os
+        import sys
         old_stdout = sys.stdout
         sys.stdout = open(os.devnull, 'w')
         try:

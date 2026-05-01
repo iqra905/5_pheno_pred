@@ -20,18 +20,16 @@ class EPICtoUKBBWeightAdapter:
         print(f"✓ Loaded EPIC checkpoint from: {epic_checkpoint_path}")
         print(f"✓ EPIC model has {sum(p.numel() for p in self.epic_checkpoint.get('model_state_dict', self.epic_checkpoint).values()):,} parameters")
     
-    def transfer_weights(self, ukbb_model, freeze_conv=False, freeze_mamba=False,
-                         freeze_transformer=False):
+    def transfer_weights(self, ukbb_model, freeze_conv=False, freeze_mamba=False):
         """
         Transfer weights layer-by-layer from EPIC to UKBB.
         Both models assume SAME SNP indices (already filtered).
-
+        
         Args:
             ukbb_model: Target UKBB model
             freeze_conv: Freeze convolutional layers after transfer
             freeze_mamba: Freeze Mamba layers after transfer
-            freeze_transformer: Freeze Transformer layers after transfer
-
+        
         Returns:
             Updated UKBB model with EPIC weights
         """
@@ -77,8 +75,6 @@ class EPICtoUKBBWeightAdapter:
             self._freeze_layers(ukbb_model, ['conv_layers'])
         if freeze_mamba:
             self._freeze_layers(ukbb_model, ['mamba_block'])
-        if freeze_transformer:
-            self._freeze_layers(ukbb_model, ['transformer_block'])
         
         print("\n" + "="*80)
         print("✓ WEIGHT TRANSFER COMPLETE")
@@ -107,29 +103,20 @@ class EPICtoUKBBWeightAdapter:
                 print(f"{name:50s} | shape: {str(param.shape):30s} | mean: {param.mean():8.4f}, std: {param.std():8.4f}")
 
 
-def load_ukbb_model_with_epic_weights(ukbb_model, epic_checkpoint_path,
-                                     freeze_conv=False, freeze_mamba=False,
-                                     freeze_transformer=False):
+def load_ukbb_model_with_epic_weights(ukbb_model, epic_checkpoint_path, 
+                                     freeze_conv=False, freeze_mamba=False):
     """
     Convenience function to load EPIC weights into UKBB model.
-
-    Usage in main script (Mamba):
+    
+    Usage in main script:
         model = load_ukbb_model_with_epic_weights(
             ukbb_model=model,
             epic_checkpoint_path=args.epic_checkpoint,
             freeze_conv=args.freeze_conv_layers,
             freeze_mamba=args.freeze_mamba_layers
         )
-
-    Usage in main script (Transformer):
-        model = load_ukbb_model_with_epic_weights(
-            ukbb_model=model,
-            epic_checkpoint_path=args.epic_checkpoint,
-            freeze_conv=args.freeze_conv_layers,
-            freeze_transformer=args.freeze_transformer_layers
-        )
     """
     adapter = EPICtoUKBBWeightAdapter(epic_checkpoint_path)
-    ukbb_model = adapter.transfer_weights(ukbb_model, freeze_conv, freeze_mamba,
-                                          freeze_transformer)
+    ukbb_model = adapter.transfer_weights(ukbb_model, freeze_conv, freeze_mamba)
+    #adapter.print_weight_statistics(ukbb_model)
     return ukbb_model

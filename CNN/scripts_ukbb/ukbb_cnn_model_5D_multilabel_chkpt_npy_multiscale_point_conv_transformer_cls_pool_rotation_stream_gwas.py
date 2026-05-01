@@ -3670,7 +3670,7 @@ def main():
         else:
             print(f"  → Loading disease-specific SNPs: {args.gwas_disease_filter}")
     elif args.dataloader_type == "epic":
-        from ukbb_dataloader_with_rotation_multigpu_filtered_epic import prepare_data_splits, create_dataloaders, create_dataloaders_with_rotation
+        from ukbb_dataloader_with_rotation_multigpu_filtered_epic_stratified import prepare_data_splits, create_dataloaders, create_dataloaders_with_rotation
         print("Using EPIC filtered dataloader")
     else:  # standard
         from ukbb_dataloader_with_rotation_multigpu import prepare_data_splits, create_dataloaders, create_dataloaders_with_rotation

@@ -14,24 +14,15 @@ from torch.amp import GradScaler, autocast
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, confusion_matrix, roc_curve, auc
 import matplotlib.pyplot as plt
 from datetime import datetime
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, CosineAnnealingWarmRestarts, StepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR, StepLR
 import argparse
 import csv
 import time
 import shutil
 import torch.nn.functional as F
+from transformers import ViTConfig, ViTModel, BertModel, BertConfig
 from transfer_learning_epic_to_ukbb import load_ukbb_model_with_epic_weights
-
 #from ukbb_dataloader_with_rotation import prepare_data_splits, create_dataloaders, create_dataloaders_with_rotation
-
-# Try to import mamba-ssm, fallback to custom implementation if not available
-try:
-    from mamba_ssm import Mamba
-    MAMBA_AVAILABLE = True
-    print("Using official mamba-ssm implementation.")
-except ImportError:
-    MAMBA_AVAILABLE = False
-    print("Warning: mamba-ssm not found. Using custom implementation.")
 
 def parse_int_list(s):
     return [int(x) for x in s.split(',')]
@@ -47,12 +38,12 @@ def parse_nested_int_list(s):
     return [[int(x) for x in layer.split(',')] for layer in layers]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Multilabel Genotype Model Training with Mamba")
-    parser.add_argument("-ID", type=str, default="Mamba_Exp_01_pretrained", help="ID of the experiment")
-    parser.add_argument("-exp_dir", type=str, default='/mnt/fast/nobackup/users/if00208/5_disease_experiments/CNN/results/5d_multilabel/multiscale/mamba', help="Directory to save experiment results")
+    parser = argparse.ArgumentParser(description="Multilabel Genotype Model Training")
+    parser.add_argument("-ID", type=str, default="01_pool", help="ID of the experiment")
+    parser.add_argument("-exp_dir", type=str, default='/mnt/fast/nobackup/scratch4weeks/if00208/ukbb/multiscale/transformer/chunked_pool/', help="Directory to save experiment results")
 
     #Genotype directory is now hardcoded in ukbb_dataloader.py (two separate paths)
-    #parser.add_argument("-phenotype_file", type=str, default='/mnt/fast/datasets/ucdatasets/gwas/ukbb/samples_chr_wise_uint8/ukb_cancers_t2d_ukb676869_13102025_cleaned_matched.tsv', help="Path to phenotype file")
+    #parser.add_argument("-phenotype_file", type=str, default='/mnt/fast/datasets/ucdatasets/gwas/ukbb/samples_chr_wise_uint8/ukb_cancers_t2d_ukb676869_13102025_cleaned.tsv', help="Path to phenotype file")
     parser.add_argument("-phenotype_file", type=str, default='/mnt/fast/datasets/ucdatasets/gwas/ukbb/samples_chr_wise_uint8/ukbb_disease_wise_matched_1_to_1/ukb_cancers_t2d_ukb676869_13102025_cleaned_matched_PanC.tsv', help="Path to phenotype file")
 
     # Model and training parameters
@@ -63,7 +54,7 @@ def parse_args():
     parser.add_argument("-peak_lr", type=float, default=1e-2, help="Peak learning rate for WarmupExponential scheduler")
     parser.add_argument("-final_lr", type=float, default=1e-5, help="Final learning rate for custom schedulers")
     parser.add_argument("-act", type=str, default="gelu", choices=["tanh","relu","gelu"], help="Activation function for the model")
-    parser.add_argument("-sch", type=str, default="cosine", choices=["none","plateau", "cosine", "cosine_warmup", "step","multistep","explr","warmup_exponential", "exponential_decay"], help="Learning rate scheduler")
+    parser.add_argument("-sch", type=str, default="cosine", choices=["none","plateau", "cosine", "step","multistep","explr","warmup_exponential", "exponential_decay"], help="Learning rate scheduler")
     parser.add_argument("-df", type=float, default=0.2, help="Decay factor for custom schedulers")
     parser.add_argument("-opt", type=str, default="adamw", choices=["adam", "adamw", "sgd"], help="Optimizer to use")
     parser.add_argument("-wd", type=float, default=0.05, help="Weight decay for optimizer")
@@ -120,62 +111,70 @@ def parse_args():
     
     parser.add_argument("-disease_labels", type=parse_str_list, default="PanC", help="Comma-separated list of disease column names in phenotype file")
 
-    # Mamba-related arguments
-    parser.add_argument("-use_mamba", type=int, default=1, choices=[0, 1], help="Whether to use Mamba layers after convolution (0: no, 1: yes)")
-    parser.add_argument("-mamba_layers", type=int, default=2, help="Number of Mamba layers")
-    parser.add_argument("-mamba_d_model", type=int, default=384, help="Mamba model dimension (d_model)")
-    parser.add_argument("-mamba_d_state", type=int, default=16, help="Mamba state dimension")
-    parser.add_argument("-mamba_d_conv", type=int, default=4, help="Mamba local convolution width")
-    parser.add_argument("-mamba_expand", type=int, default=2, help="Mamba expansion factor")
-    parser.add_argument("-mamba_dropout", type=float, default=0.1, help="Mamba dropout rate")
-    parser.add_argument("-use_mamba_norm", type=int, default=1, choices=[0, 1], help="Whether to use layer normalization in Mamba blocks")
+    # Transformer-related arguments
+    parser.add_argument("-use_transformer", type=int, default=1, choices=[0, 1], help="Whether to use transformer layers after convolution (0: no, 1: yes)")
+    parser.add_argument("-transformer_layers", type=int, default=2, help="Number of transformer encoder layers")
+    parser.add_argument("-transformer_heads", type=int, default=8, help="Number of attention heads in transformer")
+    parser.add_argument("-transformer_dim", type=int, default=384, help="Transformer model dimension (d_model)")
+    parser.add_argument("-transformer_ff_dim", type=int, default=1024, help="Transformer feedforward dimension")
+    parser.add_argument("-transformer_dropout", type=float, default=0.1, help="Transformer dropout rate")
+    parser.add_argument("-use_positional_encoding", type=int, default=1, choices=[0, 1], help="Whether to use positional encoding in transformer (0: no, 1: yes)")
+    parser.add_argument("-max_seq_len", type=int, default=10000, help="Maximum sequence length for positional encoding")
+
+    # Pretrained weight initialization arguments
+    parser.add_argument("-init_from_pretrained", type=int, default=1, choices=[0, 1], help="Whether to initialize transformer weights from pretrained model (0: no, 1: yes)")
+    parser.add_argument("-pretrained_model_type", type=str, default="bert", choices=["auto", "vit", "bert"], help="Type of pretrained model: 'auto' (detect from name), 'vit', or 'bert'")
+    parser.add_argument("-pretrained_model_name", type=str, default="bert-base-uncased", choices=["WinKawaks/vit-small-patch16-224", "zhihan1996/DNABERT-2-117M", "bert-base-uncased"], help="Name of pretrained model for weight initialization")
+    parser.add_argument("-init_layers_fraction", type=float, default=1.0, help="Fraction of transformer layers to initialize from pretrained (0.0-1.0)")
+
+    # Layer selection strategy arguments
+    parser.add_argument("-layer_init_strategy", type=str, default="middle", choices=["first", "middle", "last", "random", "custom"], help="Strategy for selecting which pretrained layers to use: first (0,1,2...), middle (center layers), last (end layers), random (random selection), custom (specify indices)")
+    parser.add_argument("-custom_layer_indices", type=str, default="4,6", help="Comma-separated list of pretrained layer indices to use (e.g., '4,5,6'). Only used when layer_init_strategy='custom'")
     
-    # Covariate integration for Mamba
-    parser.add_argument("-use_covariate_tokens", type=int, default=0, choices=[0, 1], help="Whether to process covariates as tokens in Mamba (0: concatenate at end, 1: as tokens)")
+    parser.add_argument("-use_cls_token", type=int, default=0, choices=[0, 1], help="Whether to use class token for classification (0: global pooling, 1: cls token)")
+    parser.add_argument("-use_covariate_tokens", type=int, default=0, choices=[0, 1], help="Whether to process covariates as tokens in transformer (0: concatenate at end, 1: as tokens)")
+    parser.add_argument("-covariate_token_strategy", type=str, default="combined", choices=["separate", "combined"], help="Covariate tokenization strategy: 'separate' (one token per covariate) or 'combined' (single token for all covariates)")
     parser.add_argument("-covariate_embed_dim", type=int, default=64, help="Embedding dimension for covariate tokens")
 
     # Update pooling strategy choices
-    parser.add_argument("-pooling_strategy", type=str, default="chunked", 
-                       choices=["mean", "max", "attention", "concat", "chunked", "multiscale", "multihead", "conv", "hierarchical"], 
-                       help="Pooling strategy for final sequence representation")
-    
+    parser.add_argument("-pooling_strategy", type=str, default="chunked", choices=["mean", "max", "attention", "concat", "chunked", "multiscale", "multihead", "conv", "hierarchical"], help="Pooling strategy for transformer output")
+
     # Chunked pooling parameters
     parser.add_argument("-chunked_num_chunks", type=int, default=512, help="Number of chunks for chunked pooling strategy")
     parser.add_argument("-chunked_pool_type", type=str, default="mean", choices=["mean", "max"], help="Pooling type within each chunk")
-    
+
     # Multi-scale pooling parameters
     parser.add_argument("-multiscale_window_sizes", type=parse_int_list, default=[4,8,16,32,64,128,256], help="Window sizes for multi-scale pooling (comma-separated)")
-    
+
     # Multi-head pooling parameters  
     parser.add_argument("-multihead_num_heads", type=int, default=8, help="Number of attention heads for multi-head pooling")
     parser.add_argument("-multihead_head_dim", type=int, default=256, help="Dimension of each attention head")
-    
+
     # Convolutional pooling parameters
     parser.add_argument("-conv_target_length", type=int, default=512, help="Target sequence length after convolutional pooling")
     parser.add_argument("-conv_num_layers", type=int, default=1, help="Number of convolutional layers for downsampling")
-    
+
     # Hierarchical pooling parameters
     parser.add_argument("-hierarchical_levels", type=parse_int_list, default=[1024,512,256,128,64,32], help="Hierarchical pooling levels (comma-separated)")
     
     # Checkpoint-related parameters
     parser.add_argument("-resume", type=int, default=1, choices=[0, 1], help="Whether to resume from checkpoint if available (0: no, start fresh; 1: yes, resume if available)")
     parser.add_argument("-keep_checkpoints", type=int, default=1, help="Number of recent checkpoints to keep")
-    
+
     parser.add_argument("-use_rotation", type=int, default=0, choices=[0, 1], help="Whether to use rotation-based control subsampling (0: no, 1: yes)")
     parser.add_argument("-target_ratio", type=float, default=2.506, help="Target controls:cases ratio per epoch (e.g., 5 means 5 controls per case)")
     parser.add_argument("-use_class_weights", type=int, default=0, choices=[0, 1], help="Whether to use class weights in loss function (0: no, 1: yes)")
     
     # Dataloader type selection
-    parser.add_argument("-dataloader_type", type=str, default="epic", 
-                        choices=["standard", "epic", "gwas"],
+    parser.add_argument("-dataloader_type", type=str, default="epic", choices=["standard", "epic", "gwas"],
                         help="Dataloader type: 'standard' (all SNPs), 'epic' (EPIC filtered), 'gwas' (GWAS disease-specific)")
     parser.add_argument("-gwas_disease_filter", type=str, default=None,
                         help="Disease for GWAS SNP filtering (only used when dataloader_type='gwas'). Options: t2d, prostate, breast, colon, pancreatic, or None for no filtering")
-    
+
     # Transfer learning from EPIC
-    parser.add_argument("-epic_checkpoint", type=str, default="/mnt/fast/nobackup/scratch4weeks/if00208/multiscale/epic_ukbb_common_snps/13_A_1224_07_multiscale_ks_16_128_1024_st_16_ch_32_64_128_fc_128_64_parallel_no_conv_pool_mamba_layers_2_state_16_chunked_512_cosine_lr_0.0005_wd_0.05_dropout_0.3_ukbb_common_snps/checkpoint_epoch_18.pt", help="Path to EPIC pre-trained model checkpoint for transfer learning")
+    parser.add_argument("-epic_checkpoint", type=str, default="/mnt/fast/nobackup/scratch4weeks/if00208/multiscale/epic_ukbb_common_snps/13_multiscale_ks_16_128_1024_st_16_ch_32_64_128_fc_128_64_parallel_no_conv_pool_transformer_bert_dropout_0.1_pool_chunked_ukbb_common_snps/checkpoint_epoch_10.pt", help="Path to EPIC pre-trained model checkpoint for transfer learning (None = train from scratch)")
     parser.add_argument("-freeze_conv_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze conv layers after EPIC transfer (0: no, 1: yes)")
-    parser.add_argument("-freeze_mamba_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze Mamba layers after EPIC transfer (0: no, 1: yes)")
+    parser.add_argument("-freeze_transformer_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze Transformer layers after EPIC transfer (0: no, 1: yes)")
 
     # Debug / fast-iteration flags
     parser.add_argument("-debug_n_subjects", type=int, default=100, help="Limit dataset to N subjects for fast debugging (None = use all subjects)")
@@ -279,51 +278,34 @@ def calculate_pooling_output_dim(pooling_strategy, d_model, pooling_kwargs):
     else:  # concat
         return None  # Will be calculated later
 
-# class AttentionPooling(nn.Module):
-#     """Learnable attention-based pooling for sequence outputs"""
-#     def __init__(self, input_dim, hidden_dim=256):
-#         super(AttentionPooling, self).__init__()
-#         self.attention = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim),
-#             nn.Tanh(),
-#             nn.Linear(hidden_dim, 1)
-#         )
-#         self.softmax = nn.Softmax(dim=1)
-        
-#     def forward(self, x):
-#         """
-#         Args:
-#             x: [batch_size, seq_len, input_dim]
-#         Returns:
-#             pooled: [batch_size, input_dim]
-#         """
-#         # Compute attention weights
-#         attention_weights = self.attention(x)  # [batch_size, seq_len, 1]
-#         attention_weights = self.softmax(attention_weights)  # [batch_size, seq_len, 1]
-        
-#         # Apply attention weights
-#         pooled = torch.sum(x * attention_weights, dim=1)  # [batch_size, input_dim]
-        
-#         return pooled
-
 class AttentionPooling(nn.Module):
+    """Learnable attention-based pooling for transformer outputs"""
+    
     def __init__(self, input_dim, hidden_dim=256):
-        super().__init__()
+        super(AttentionPooling, self).__init__()
         self.attention = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
-        #self.projection = nn.Linear(input_dim, output_dim)
+        self.softmax = nn.Softmax(dim=1)
         
     def forward(self, x):
+        """
+        Args:
+            x: [batch_size, seq_len, input_dim]
+        Returns:
+            pooled: [batch_size, input_dim]
+        """
         # Compute attention weights
-        attention_weights = F.softmax(self.attention(x), dim=1)
-        # Apply attention and project
-        weighted = torch.sum(x * attention_weights, dim=1)
-        #return self.projection(weighted)
-        return weighted
+        attention_weights = self.attention(x)  # [batch_size, seq_len, 1]
+        attention_weights = self.softmax(attention_weights)  # [batch_size, seq_len, 1]
         
+        # Apply attention weights
+        pooled = torch.sum(x * attention_weights, dim=1)  # [batch_size, input_dim]
+        
+        return pooled
+
 # class ChunkedPooling(nn.Module):
 #     """Divide sequence into chunks and pool within each chunk"""
 #     def __init__(self, num_chunks=32, pool_type='mean'):
@@ -424,7 +406,6 @@ class ChunkedPooling(nn.Module):
         output = output.view(batch_size, -1)  # [batch, num_chunks * d_model]
         
         return output
-
 
 class MultiScalePooling(nn.Module):
     """Apply different pooling window sizes to capture multi-scale patterns"""
@@ -733,79 +714,18 @@ class EarlyStopping:
         self.val_loss_min = state_dict['val_loss_min']
         self.initial_run = True  # Always reset to True when loading, to force synchronization
 
-
-# Custom Mamba implementation if mamba-ssm is not available
-class CustomMambaLayer(nn.Module):
-    """A simplified Mamba-like layer for genomic sequences"""
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dropout=0.1):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        
-        d_inner = int(self.expand * d_model)
-        
-        # Input projection
-        self.in_proj = nn.Linear(d_model, d_inner * 2)
-        
-        # Convolution for local dependencies
-        self.conv1d = nn.Conv1d(
-            in_channels=d_inner,
-            out_channels=d_inner,
-            kernel_size=d_conv,
-            padding=d_conv - 1,
-            groups=d_inner  # Depthwise convolution
-        )
-        
-        # State space parameters (simplified)
-        self.x_proj = nn.Linear(d_inner, d_state)
-        self.dt_proj = nn.Linear(d_inner, d_inner)
-        
-        # Output projection
-        self.out_proj = nn.Linear(d_inner, d_model)
-        
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.SiLU()
-        
-    def forward(self, x):
-        # x: (batch, seq_len, d_model)
-        batch_size, seq_len, _ = x.shape
-        
-        # Input projection and split
-        xz = self.in_proj(x)  # (batch, seq_len, 2 * d_inner)
-        x_input, z = xz.chunk(2, dim=-1)  # Each: (batch, seq_len, d_inner)
-        
-        # Apply convolution (needs channel-first format)
-        x_conv = self.conv1d(x_input.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
-        x_conv = self.act(x_conv)
-        
-        # Simplified state space modeling (this is a very basic approximation)
-        # In real Mamba, this would involve selective state space computation
-        x_state = self.x_proj(x_conv)  # Project to state dimension
-        dt = F.softplus(self.dt_proj(x_conv))  # Time step
-        
-        # Simple recurrent-like processing (not true SSM)
-        y = x_conv * torch.sigmoid(dt)
-        
-        # Gate with z
-        y = y * self.act(z)
-        
-        # Output projection
-        output = self.out_proj(y)
-        return self.dropout(output)
-
 class CovariateTokenEmbedder(nn.Module):
-    """Convert covariates into tokens for Mamba processing"""
+    """Convert covariates into tokens for transformer processing"""
     
-    def __init__(self, mamba_dim, embed_dim=64, use_age=True, use_gender=True, use_bmi=True, use_pcs=True):
+    def __init__(self, transformer_dim, embed_dim=64, strategy="separate", use_age=True, use_gender=True, use_bmi=True, use_pcs=True):
         super(CovariateTokenEmbedder, self).__init__()
         
         self.use_age = use_age
         self.use_gender = use_gender  
         self.use_bmi = use_bmi
         self.use_pcs = use_pcs
-        self.mamba_dim = mamba_dim
+        self.transformer_dim = transformer_dim
+        self.strategy = strategy
 
         # Calculate total covariate dimensions
         total_cov_dim = 0
@@ -820,39 +740,175 @@ class CovariateTokenEmbedder(nn.Module):
             
         self.total_cov_dim = total_cov_dim
         
-        # Single embedder for all covariates combined
-        if total_cov_dim > 0:
+        if strategy == "separate":
+            # Separate embedders for each covariate type
+            self.embedders = nn.ModuleDict()
+            
+            if use_age:
+                self.embedders['age'] = nn.Sequential(
+                    nn.Linear(1, embed_dim),
+                    nn.GELU(),
+                    nn.Linear(embed_dim, transformer_dim)
+                )
+                
+            if use_gender:
+                self.embedders['gender'] = nn.Sequential(
+                    nn.Linear(1, embed_dim),
+                    nn.GELU(), 
+                    nn.Linear(embed_dim, transformer_dim)
+                )
+                
+            if use_bmi:
+                self.embedders['bmi'] = nn.Sequential(
+                    nn.Linear(1, embed_dim),
+                    nn.GELU(),
+                    nn.Linear(embed_dim, transformer_dim)
+                )
+                
+            if use_pcs:
+                self.embedders['pcs'] = nn.Sequential(
+                    nn.Linear(6, embed_dim),  # 6 PCs
+                    nn.GELU(),
+                    nn.Linear(embed_dim, transformer_dim)
+                )
+            
+            # Token type embeddings for separate tokens (optional - helps transformer distinguish token types)
+            self.token_type_embeddings = nn.Embedding(5, transformer_dim)  # genomic, age, gender, bmi, pcs
+        
+        elif strategy == "combined":
+            # Single embedder for all covariates combined
             self.combined_embedder = nn.Sequential(
                 nn.Linear(total_cov_dim, embed_dim),
                 nn.GELU(),
-                nn.Linear(embed_dim, mamba_dim)
+                nn.Linear(embed_dim, transformer_dim)
             )
+            
+            # Single token type embedding for combined token
+            self.token_type_embeddings = nn.Embedding(2, transformer_dim)  # genomic, combined_covariates
         
         print(f"  CovariateTokenEmbedder created:")
-        print(f"    - Combined token dimensions: {total_cov_dim}")
-        enabled_covs = []
-        if use_pcs: enabled_covs.append("PCs(6)")
-        if use_age: enabled_covs.append("Age(1)")
-        if use_gender: enabled_covs.append("Gender(1)")
-        if use_bmi: enabled_covs.append("BMI(1)")
-        print(f"    - Included covariates: {', '.join(enabled_covs)}")
-        print(f"    - Embed dim: {embed_dim} -> Mamba dim: {mamba_dim}")
+        print(f"    - Strategy: {strategy}")
+        if strategy == "separate":
+            print(f"    - Age tokens: {'Yes' if use_age else 'No'}")
+            print(f"    - Gender tokens: {'Yes' if use_gender else 'No'}")
+            print(f"    - BMI tokens: {'Yes' if use_bmi else 'No'}")
+            print(f"    - PC tokens: {'Yes' if use_pcs else 'No'}")
+        else:  # combined
+            print(f"    - Combined token dimensions: {total_cov_dim}")
+            enabled_covs = []
+            if use_pcs: enabled_covs.append("PCs(6)")
+            if use_age: enabled_covs.append("Age(1)")
+            if use_gender: enabled_covs.append("Gender(1)")
+            if use_bmi: enabled_covs.append("BMI(1)")
+            print(f"    - Included covariates: {', '.join(enabled_covs)}")
+        print(f"    - Embed dim: {embed_dim} -> Transformer dim: {transformer_dim}")
     
-    def forward(self, covariates_tensor):
+    def forward(self, covariates_dict):
         """
         Args:
-            covariates_tensor: [batch_size, total_cov_dim] concatenated covariates
+            covariates_dict: Dictionary with keys 'age', 'gender', 'bmi', 'pcs'
+                           Each value is [batch_size, feature_dim]
         Returns:
-            covariate_tokens: [batch_size, 1, mamba_dim]
+            covariate_tokens: [batch_size, num_tokens, transformer_dim]
+            token_types: [batch_size, num_tokens] for token type embeddings
         """
-        if covariates_tensor is None or covariates_tensor.numel() == 0 or self.total_cov_dim == 0:
-            return None
+        if not covariates_dict:  # Empty dictionary
+            print("WARNING: NO COVARIATES USED - returning none for embeddings")
+            return None, None
+
+        batch_size = list(covariates_dict.values())[0].size(0)
+
+        if self.strategy == "separate":
+            return self._forward_separate(covariates_dict, batch_size)
+        elif self.strategy == "combined":
+            return self._forward_combined(covariates_dict, batch_size)
+        else:
+            # Fallback case
+            print(f"Warning: Unknown covariate token strategy '{self.strategy}', returning None")
+            return None, None
+
+    def _forward_separate(self, covariates_dict, batch_size):
+        """Create separate tokens for each covariate type"""
+        tokens = []
+        token_types = []
+        token_idx = 1  # 0 reserved for genomic tokens
         
-        # Create single combined token
-        combined_token = self.combined_embedder(covariates_tensor)  # [batch_size, mamba_dim]
-        combined_token = combined_token.unsqueeze(1)  # [batch_size, 1, mamba_dim]
+        if self.use_age and 'age' in covariates_dict:
+            age_token = self.embedders['age'](covariates_dict['age'].unsqueeze(-1))  # [batch, transformer_dim]
+            age_token = age_token.unsqueeze(1)  # [batch, 1, transformer_dim]
+            tokens.append(age_token)
+            token_types.append(torch.full((batch_size, 1), token_idx, device=age_token.device))
+            token_idx += 1
+            
+        if self.use_gender and 'gender' in covariates_dict:
+            gender_token = self.embedders['gender'](covariates_dict['gender'].unsqueeze(-1))  # [batch, transformer_dim]
+            gender_token = gender_token.unsqueeze(1)  # [batch, 1, transformer_dim]
+            tokens.append(gender_token)
+            token_types.append(torch.full((batch_size, 1), token_idx, device=gender_token.device))
+            token_idx += 1
+            
+        if self.use_bmi and 'bmi' in covariates_dict:
+            bmi_token = self.embedders['bmi'](covariates_dict['bmi'].unsqueeze(-1))  # [batch, transformer_dim]
+            bmi_token = bmi_token.unsqueeze(1)  # [batch, 1, transformer_dim]
+            tokens.append(bmi_token)
+            token_types.append(torch.full((batch_size, 1), token_idx, device=bmi_token.device))
+            token_idx += 1
+            
+        if self.use_pcs and 'pcs' in covariates_dict:
+            pcs_token = self.embedders['pcs'](covariates_dict['pcs'])  # [batch, transformer_dim]
+            pcs_token = pcs_token.unsqueeze(1)  # [batch, 1, transformer_dim]
+            tokens.append(pcs_token)
+            token_types.append(torch.full((batch_size, 1), token_idx, device=pcs_token.device))
+            token_idx += 1
         
-        return combined_token
+        if tokens:
+            covariate_tokens = torch.cat(tokens, dim=1)  # [batch_size, num_covariate_tokens, transformer_dim]
+            token_type_ids = torch.cat(token_types, dim=1)  # [batch_size, num_covariate_tokens]
+            
+            # Add token type embeddings
+            type_embeddings = self.token_type_embeddings(token_type_ids)
+            covariate_tokens = covariate_tokens + type_embeddings
+            
+            return covariate_tokens, token_type_ids
+        else:
+            return None, None
+    
+    def _forward_combined(self, covariates_dict, batch_size):
+        """Create a single combined token for all covariates"""
+        # Collect all covariates in a consistent order
+        cov_features = []
+        
+        # Always follow the same order: PCs, Age, Gender, BMI
+        if self.use_pcs and 'pcs' in covariates_dict:
+            cov_features.append(covariates_dict['pcs'])  # [batch_size, 6]
+        
+        if self.use_age and 'age' in covariates_dict:
+            cov_features.append(covariates_dict['age'].unsqueeze(-1))  # [batch_size, 1]
+            
+        if self.use_gender and 'gender' in covariates_dict:
+            cov_features.append(covariates_dict['gender'].unsqueeze(-1))  # [batch_size, 1]
+            
+        if self.use_bmi and 'bmi' in covariates_dict:
+            cov_features.append(covariates_dict['bmi'].unsqueeze(-1))  # [batch_size, 1]
+        
+        if cov_features:
+            # Concatenate all covariates
+            combined_covariates = torch.cat(cov_features, dim=1)  # [batch_size, total_cov_dim]
+            
+            # Create single combined token
+            combined_token = self.combined_embedder(combined_covariates)  # [batch_size, transformer_dim]
+            combined_token = combined_token.unsqueeze(1)  # [batch_size, 1, transformer_dim]
+            
+            # Token type for combined covariate token
+            token_type_ids = torch.full((batch_size, 1), 1, device=combined_token.device)  # 1 for combined covariates
+            
+            # Add token type embedding
+            type_embeddings = self.token_type_embeddings(token_type_ids)
+            combined_token = combined_token + type_embeddings
+            
+            return combined_token, token_type_ids
+        else:
+            return None, None
 
 class DiseaseSpecificAttention(nn.Module):
     """Disease-specific attention mechanism"""
@@ -922,6 +978,28 @@ class DiseaseSpecificAttention(nn.Module):
         
         # Stack disease-specific features
         return torch.stack(disease_outputs, dim=1)  # (batch_size, num_diseases, feature_dim)
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for transformer"""
+    def __init__(self, d_model, max_len=10000, dropout=0.1):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        # Register as buffer (not a parameter, but part of the model state)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        # x shape: (seq_len, batch_size, d_model)
+        x = x + self.pe[:x.size(0), :]
+        return self.dropout(x)
 
 class MultiScaleConvBlock(nn.Module):
     """Multi-scale convolution block with different kernel sizes and strides"""
@@ -1067,41 +1145,32 @@ class ParallelMultiScaleConvBlock(nn.Module):
         self.num_branches = len(kernel_sizes)
         self.use_pointwise_conv = use_pointwise_conv
         self.pointwise_channels = pointwise_channels
-        self.dropout_rate = dropout_rate
         
         # Create parallel branches for this layer
         for branch_idx, (kernel_size, stride) in enumerate(zip(kernel_sizes, strides)):
             
+            # Ensure proper padding
             padding = kernel_size // 2
             
-            layers = [
+            # Main convolution layers (no pointwise here)
+            branch = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, 
-                          kernel_size=kernel_size, stride=stride, padding=padding),
+                         kernel_size=kernel_size, stride=stride, padding=padding),
                 nn.BatchNorm1d(out_channels),
                 self.get_activation(act)
-            ]
+            )
             
-            # Add dropout for intermediate layers only
-            if not self.is_final_layer and self.dropout_rate > 0:
-                layers.append(nn.Dropout(p=self.dropout_rate))
-            
-            branch = nn.Sequential(*layers)
             self.branches.append(branch)
         
         # Add pointwise convolution layers for final layer only
         if self.use_pointwise_conv and self.is_final_layer:
             self.pointwise_branches = nn.ModuleList()
             for i in range(self.num_branches):
-                pointwise_layers = [
+                pointwise_conv = nn.Sequential(
                     nn.Conv1d(out_channels, pointwise_channels, kernel_size=1, stride=1, padding=0),
                     nn.BatchNorm1d(pointwise_channels),
                     self.get_activation(act)
-                ]
-                
-                # Optional: if you ever want dropout here too, you can enable this
-                # but currently respecting "no dropout in final layer"
-                
-                pointwise_conv = nn.Sequential(*pointwise_layers)
+                )
                 self.pointwise_branches.append(pointwise_conv)
         
         # Initialize empty ModuleList for final pooling layers (only for final layer)
@@ -1240,167 +1309,774 @@ class SeparateDiseaseHead(nn.Module):
     def forward(self, x):
         return self.head(x)
 
-class GenomicMambaBlock(nn.Module):
-    """Genomic Mamba processing block"""
+class GenomicTransformerBlock(nn.Module):
+    """Enhanced genomic transformer with class token and covariate integration supporting both ViT and BERT"""
     
-    def __init__(self, input_dim, d_model, d_state=16, d_conv=4, expand=2, 
-                 num_layers=4, dropout=0.1, use_norm=True,
-                 use_covariate_tokens=False, covariate_embed_dim=64, 
-                 pooling_strategy="mean",
-                 use_age=True, use_gender=True, use_bmi=True, use_pcs=True, 
-                 **pooling_kwargs):
-        super(GenomicMambaBlock, self).__init__()
+    def __init__(self, input_dim, transformer_dim, num_layers=2, num_heads=4, 
+             ff_dim=1024, dropout=0.1, use_positional_encoding=True, max_seq_len=10000,
+             use_cls_token=True, use_covariate_tokens=False, 
+             covariate_embed_dim=64, covariate_token_strategy="separate", pooling_strategy="mean",
+             use_age=True, use_gender=True, use_bmi=True, use_pcs=True,
+             init_from_pretrained=False, pretrained_model_name="WinKawaks/vit-small-patch16-224",
+             pretrained_model_type="auto", 
+             init_layers_fraction=1.0, layer_init_strategy="middle", custom_layer_indices="",
+             **pooling_kwargs): 
+        super(GenomicTransformerBlock, self).__init__()
         
         self.input_dim = input_dim
-        self.d_model = d_model
+        self.transformer_dim = transformer_dim
         self.num_layers = num_layers
-        self.use_norm = use_norm
+        self.use_positional_encoding = use_positional_encoding
+        self.init_from_pretrained = init_from_pretrained
+        self.pretrained_model_name = pretrained_model_name
+        self.pretrained_model_type = pretrained_model_type
+        self.init_layers_fraction = init_layers_fraction
+        self.layer_init_strategy = layer_init_strategy
+        self.custom_layer_indices = custom_layer_indices
+
+        self.use_cls_token = use_cls_token
         self.use_covariate_tokens = use_covariate_tokens
+        self.covariate_token_strategy = covariate_token_strategy
         self.pooling_strategy = pooling_strategy
-        
-        print(f"  Creating Genomic Mamba Block:")
-        print(f"    - Covariate tokens: {'Enabled' if use_covariate_tokens else 'Disabled (concatenate at end)'}")
-        print(f"    - Pooling strategy: {pooling_strategy}")
-        
-        # Project input to Mamba dimension if needed
-        self.input_projection = None
-        if input_dim != d_model:
-            self.input_projection = nn.Linear(input_dim, d_model)
-            print(f"  - Adding input projection: {input_dim} → {d_model}")
-        
-        self.pooling_strategy = pooling_strategy
-        
+
         # Initialize pooling layer based on strategy
         if pooling_strategy == "chunked":
             self.custom_pooling = ChunkedPooling(**pooling_kwargs)
         elif pooling_strategy == "multiscale":
-            self.custom_pooling = MultiScalePooling(d_model=d_model, **pooling_kwargs)
+            self.custom_pooling = MultiScalePooling(d_model=transformer_dim, **pooling_kwargs)
         elif pooling_strategy == "multihead":
-            self.custom_pooling = MultiHeadPooling(d_model=d_model, **pooling_kwargs)
+            self.custom_pooling = MultiHeadPooling(d_model=transformer_dim, **pooling_kwargs)
         elif pooling_strategy == "conv":
-            self.custom_pooling = ConvolutionalPooling(d_model=d_model, **pooling_kwargs)
+            self.custom_pooling = ConvolutionalPooling(d_model=transformer_dim, **pooling_kwargs)
         elif pooling_strategy == "hierarchical":
-            self.custom_pooling = HierarchicalPooling(d_model=d_model, **pooling_kwargs)
+            self.custom_pooling = HierarchicalPooling(d_model=transformer_dim, **pooling_kwargs)
         elif pooling_strategy == "attention":
-            self.attention_pooling = AttentionPooling(d_model)
+            self.attention_pooling = AttentionPooling(transformer_dim, transformer_dim)
         
         # Calculate final output dimension
-        self.final_output_dim = calculate_pooling_output_dim(pooling_strategy, d_model, pooling_kwargs)
+        self.final_output_dim = calculate_pooling_output_dim(pooling_strategy, transformer_dim, pooling_kwargs)
 
-        print(f"GenomicMambaBlock initialized:")
-        print(f"  - Input dimension: {input_dim}")
-        if self.final_output_dim:
-            print(f"  - Output dimension: {self.final_output_dim}")
-        else:
-            print(f"  - Output dimension: Variable (concat strategy)")
+        print(f"  Creating Enhanced Genomic Transformer:")
+        print(f"    - Class token: {'Enabled' if use_cls_token else 'Disabled (using ' + pooling_strategy + ' pooling)'}")
+        print(f"    - Covariate tokens: {'Enabled' if use_covariate_tokens else 'Disabled (concatenate at end)'}")
+        if use_covariate_tokens:
+            print(f"    - Covariate strategy: {covariate_token_strategy}")
+        if not use_cls_token:
+            print(f"    - Pooling strategy: {pooling_strategy}")
+        
+        # Project input to transformer dimension if needed
+        self.input_projection = None
+        if input_dim != transformer_dim:
+            self.input_projection = nn.Linear(input_dim, transformer_dim)
+            print(f"  - Adding input projection: {input_dim} → {transformer_dim}")
+        
+        # Class token 
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.randn(1, 1, transformer_dim))
+            print(f"    - Class token initialized: [1, 1, {transformer_dim}]")
+        
+        # Pooling strategy (only used when not using cls token)
+        if not use_cls_token:
+            if pooling_strategy == "attention":
+                self.attention_pooling = AttentionPooling(transformer_dim)
+                print(f"    - Attention pooling initialized")
+            elif pooling_strategy == "concat":
+                print(f"    - Concat pooling")
         
         # Covariate token embedder
         if use_covariate_tokens:
             self.covariate_embedder = CovariateTokenEmbedder(
-                d_model, covariate_embed_dim, use_age, use_gender, use_bmi, use_pcs
+                transformer_dim, covariate_embed_dim, covariate_token_strategy, use_age, use_gender, use_bmi, use_pcs
             )
         
-        # Mamba layers
-        if MAMBA_AVAILABLE:
-            self.mamba_layers = nn.ModuleList([
-                Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
-                for _ in range(num_layers)
-            ])
-            print(f"  - Using official Mamba implementation")
-        else:
-            self.mamba_layers = nn.ModuleList([
-                CustomMambaLayer(d_model, d_state, d_conv, expand, dropout)
-                for _ in range(num_layers)
-            ])
-            print(f"  - Using custom Mamba implementation")
+        # Positional encoding
+        if use_positional_encoding:
+            self.pos_encoding = PositionalEncoding(transformer_dim, max_seq_len, dropout)
+            print(f"  - Adding positional encoding (max_len={max_seq_len})")
+        
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=transformer_dim,
+            nhead=num_heads,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=False  # (seq_len, batch_size, features)
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers
+        )
         
         # Layer normalization
-        if use_norm:
-            self.layer_norms = nn.ModuleList([
-                nn.LayerNorm(d_model) for _ in range(num_layers)
-            ])
+        self.layer_norm = nn.LayerNorm(transformer_dim)
+        #self.final_output_dim = transformer_dim
         
+        # Initialize weights from pretrained model if requested
+        if init_from_pretrained:
+            self._initialize_from_pretrained()
         
-        
-        #self.final_output_dim = d_model
-        
-        print(f"GenomicMambaBlock initialized:")
+        print(f"GenomicTransformerBlock initialized:")
         print(f"  - Input dimension: {input_dim}")
         print(f"  - Output dimension: {self.final_output_dim}")
-        print(f"  - Mamba dimension: {d_model}")
+        print(f"  - Transformer dimension: {transformer_dim}")
         print(f"  - Number of layers: {num_layers}")
-        print(f"  - State dimension: {d_state}")
-        print(f"  - Convolution width: {d_conv}")
-        print(f"  - Expansion factor: {expand}")
+        print(f"  - Number of heads: {num_heads}")
+        print(f"  - Feedforward dimension: {ff_dim}")
         print(f"  - Dropout: {dropout}")
-        print(f"  - Layer normalization: {use_norm}")
+        print(f"  - Using positional encoding: {use_positional_encoding}")
+        print(f"  - Initialize from pretrained: {init_from_pretrained}")
+        if init_from_pretrained:
+            print(f"  - Pretrained model: {pretrained_model_name}")
+            print(f"  - Model type: {pretrained_model_type}")
+            print(f"  - Layer selection strategy: {layer_init_strategy}")
     
+    def _detect_model_type(self, model_name, specified_type):
+        """Automatically detect model type from name or use specified type"""
+        if specified_type.lower() != "auto":
+            return specified_type.lower()
+        
+        model_name_lower = model_name.lower()
+        
+        # Detection patterns
+        if any(pattern in model_name_lower for pattern in ['vit', 'vision']):
+            return "vit"
+        elif any(pattern in model_name_lower for pattern in ['bert', 'dnabert', 'biobert']):
+            return "bert"
+        else:
+            # Default fallback - could also raise an error
+            print(f"Warning: Could not auto-detect model type for '{model_name}'. Defaulting to 'bert'")
+            return "bert"
+    
+    def _initialize_from_pretrained(self):
+        """Initialize transformer weights from pretrained model (ViT or BERT)"""
+        model_type = self._detect_model_type(self.pretrained_model_name, self.pretrained_model_type)
+        
+        print(f"\n  Initializing transformer weights from pretrained {model_type.upper()} model: {self.pretrained_model_name}")
+        print(f"  Model type: {model_type} ({'auto-detected' if self.pretrained_model_type == 'auto' else 'manually specified'})")
+        
+        try:
+            if model_type == "vit":
+                self._initialize_from_vit()
+            elif model_type == "bert":
+                self._initialize_from_bert()
+            else:
+                raise ValueError(f"Unsupported model type: {model_type}")
+                
+        except Exception as e:
+            print(f"  - Warning: Could not initialize from pretrained model: {e}")
+            print(f"  - Continuing with random initialization") 
+    def _initialize_from_vit(self):
+        """Initialize from Vision Transformer"""
+        from transformers import ViTModel
+        
+        # Load pretrained ViT model
+        pretrained_vit = ViTModel.from_pretrained(self.pretrained_model_name)
+        pretrained_layers = pretrained_vit.encoder.layer
+        
+        print(f"  - Loaded pretrained ViT model with {len(pretrained_layers)} layers")
+        print(f"  - Pretrained hidden size: {pretrained_vit.config.hidden_size}")
+        print(f"  - Pretrained num heads: {pretrained_vit.config.num_attention_heads}")
+        print(f"  - Pretrained intermediate size: {pretrained_vit.config.intermediate_size}")
+        
+        # Calculate how many layers to initialize
+        num_layers_to_init = int(self.num_layers * self.init_layers_fraction)
+        print(f"  - Initializing {num_layers_to_init} out of {self.num_layers} custom layers")
+        
+        # Determine which pretrained layers to use
+        pretrained_layer_indices = self._select_pretrained_layers(
+            len(pretrained_layers), 
+            num_layers_to_init
+        )
+        
+        print(f"  - Using pretrained layers: {pretrained_layer_indices}")
+        print(f"  - Layer selection strategy: {self.layer_init_strategy}")
+        
+        self._copy_vit_weights(pretrained_layers, pretrained_layer_indices)
+        
+        print(f"  - ViT weight initialization completed successfully")
+    
+    def _initialize_from_bert(self):
+        """Initialize from BERT model"""
+        from transformers import BertModel
+        
+        # Load pretrained BERT model
+        pretrained_bert = BertModel.from_pretrained(self.pretrained_model_name)
+        pretrained_layers = pretrained_bert.encoder.layer
+        
+        print(f"  - Loaded pretrained BERT model with {len(pretrained_layers)} layers")
+        print(f"  - Pretrained hidden size: {pretrained_bert.config.hidden_size}")
+        print(f"  - Pretrained num heads: {pretrained_bert.config.num_attention_heads}")
+        print(f"  - Pretrained intermediate size: {pretrained_bert.config.intermediate_size}")
+        
+        # Calculate how many layers to initialize
+        num_layers_to_init = int(self.num_layers * self.init_layers_fraction)
+        print(f"  - Initializing {num_layers_to_init} out of {self.num_layers} custom layers")
+        
+        # Determine which pretrained layers to use
+        pretrained_layer_indices = self._select_pretrained_layers(
+            len(pretrained_layers), 
+            num_layers_to_init
+        )
+        
+        print(f"  - Using pretrained layers: {pretrained_layer_indices}")
+        print(f"  - Layer selection strategy: {self.layer_init_strategy}")
+        
+        self._copy_bert_weights(pretrained_layers, pretrained_layer_indices)
+        
+        print(f"  - BERT weight initialization completed successfully")
+    
+    def _select_pretrained_layers(self, total_pretrained_layers, num_layers_needed):
+        """Select which pretrained layers to use based on strategy"""
+        
+        if self.layer_init_strategy == "first":
+            # Use first N layers: [0, 1, 2, ...]
+            selected = list(range(min(num_layers_needed, total_pretrained_layers)))
+            print(f"    Selected first layers: {selected}")
+            return selected
+        
+        elif self.layer_init_strategy == "middle":
+            # Use middle layers
+            if total_pretrained_layers < num_layers_needed:
+                return list(range(total_pretrained_layers))
+            
+            # Calculate middle range
+            start_idx = (total_pretrained_layers - num_layers_needed) // 2
+            end_idx = start_idx + num_layers_needed
+            selected = list(range(start_idx, end_idx))
+            
+            print(f"    Selected middle layers from index {start_idx} to {end_idx-1}: {selected}")
+            return selected
+        
+        elif self.layer_init_strategy == "last":
+            # Use last N layers: [..., -3, -2, -1]
+            start_idx = max(0, total_pretrained_layers - num_layers_needed)
+            selected = list(range(start_idx, total_pretrained_layers))
+            
+            print(f"    Selected last layers from index {start_idx} to {total_pretrained_layers-1}: {selected}")
+            return selected
+        
+        elif self.layer_init_strategy == "random":
+            # Randomly select N layers
+            import random
+            available_indices = list(range(total_pretrained_layers))
+            selected = sorted(random.sample(available_indices, min(num_layers_needed, total_pretrained_layers)))
+            
+            print(f"    Randomly selected layers: {selected}")
+            return selected
+        
+        elif self.layer_init_strategy == "custom":
+            # Use user-specified layers
+            if not self.custom_layer_indices:
+                print(f"    Warning: custom strategy selected but no indices provided, falling back to first layers")
+                return list(range(min(num_layers_needed, total_pretrained_layers)))
+            
+            try:
+                custom_indices = [int(x.strip()) for x in self.custom_layer_indices.split(',')]
+                # Validate indices
+                valid_indices = [idx for idx in custom_indices if 0 <= idx < total_pretrained_layers]
+                
+                if len(valid_indices) != len(custom_indices):
+                    print(f"    Warning: Some indices were invalid. Using valid indices: {valid_indices}")
+                
+                # Take only what we need
+                selected = valid_indices[:num_layers_needed]
+                print(f"    Using custom layer indices: {selected}")
+                return selected
+                
+            except ValueError as e:
+                print(f"    Error parsing custom indices: {e}, falling back to first layers")
+                return list(range(min(num_layers_needed, total_pretrained_layers)))
+        
+        else:
+            # Fallback to first layers
+            print(f"    Unknown strategy '{self.layer_init_strategy}', using first layers")
+            return list(range(min(num_layers_needed, total_pretrained_layers)))
+    
+    def _copy_vit_weights(self, pretrained_layers, pretrained_layer_indices):
+        """Copy weights from ViT layers"""
+        for i, pretrained_idx in enumerate(pretrained_layer_indices):
+            if i < len(self.transformer_encoder.layers):
+                print(f"    Initializing custom layer {i} from ViT layer {pretrained_idx}")
+                self._copy_vit_layer_weights(
+                    pretrained_layers[pretrained_idx], 
+                    self.transformer_encoder.layers[i],
+                    layer_idx=i
+                )
+    
+    def _copy_bert_weights(self, pretrained_layers, pretrained_layer_indices):
+        """Copy weights from BERT layers"""
+        for i, pretrained_idx in enumerate(pretrained_layer_indices):
+            if i < len(self.transformer_encoder.layers):
+                print(f"    Initializing custom layer {i} from BERT layer {pretrained_idx}")
+                self._copy_bert_layer_weights(
+                    pretrained_layers[pretrained_idx], 
+                    self.transformer_encoder.layers[i],
+                    layer_idx=i
+                )
+
+    def _adapt_weight_tensor(self, pretrained_weight, target_shape, weight_name):
+        """Intelligently adapt pretrained weights to target shape"""
+        pretrained_shape = pretrained_weight.shape
+        
+        if pretrained_shape == target_shape:
+            return pretrained_weight.clone()
+        
+        #print(f"       Adapting {weight_name}: {pretrained_shape} → {target_shape}")
+        
+        # For 2D weights (Linear layer weights)
+        if len(target_shape) == 2 and len(pretrained_shape) == 2:
+            target_out, target_in = target_shape
+            pretrained_out, pretrained_in = pretrained_shape
+            
+            # Create new tensor with target shape
+            adapted_weight = torch.zeros(target_shape, dtype=pretrained_weight.dtype, device=pretrained_weight.device)
+            
+            # Copy overlapping region
+            copy_out = min(target_out, pretrained_out)
+            copy_in = min(target_in, pretrained_in)
+            
+            adapted_weight[:copy_out, :copy_in] = pretrained_weight[:copy_out, :copy_in]
+            
+            # Initialize remaining weights
+            if target_out > pretrained_out or target_in > pretrained_in:
+                # Use Xavier/Glorot initialization for new weights
+                with torch.no_grad():
+                    fan_in, fan_out = target_in, target_out
+                    std = math.sqrt(2.0 / (fan_in + fan_out))
+                    
+                    # Initialize new rows (if target_out > pretrained_out)
+                    if target_out > pretrained_out:
+                        adapted_weight[copy_out:, :copy_in].normal_(0, std)
+                    
+                    # Initialize new columns (if target_in > pretrained_in)  
+                    if target_in > pretrained_in:
+                        adapted_weight[:copy_out, copy_in:].normal_(0, std)
+                        
+                    # Initialize new intersection (if both dimensions expanded)
+                    if target_out > pretrained_out and target_in > pretrained_in:
+                        adapted_weight[copy_out:, copy_in:].normal_(0, std)
+            
+            # adaptation_info = f"copied {copy_out}×{copy_in}, initialized {target_out-copy_out}×{target_in-copy_in}"
+            # print(f"        ✓ {adaptation_info}")
+            return adapted_weight
+            
+        # For 1D weights (bias vectors, layer norm weights)
+        elif len(target_shape) == 1 and len(pretrained_shape) == 1:
+            target_dim = target_shape[0]
+            pretrained_dim = pretrained_shape[0]
+            
+            adapted_weight = torch.zeros(target_shape, dtype=pretrained_weight.dtype, device=pretrained_weight.device)
+            
+            copy_dim = min(target_dim, pretrained_dim)
+            adapted_weight[:copy_dim] = pretrained_weight[:copy_dim]
+            
+            # Initialize remaining elements (bias usually to 0, others to small random)
+            if target_dim > pretrained_dim:
+                if 'bias' in weight_name.lower():
+                    adapted_weight[copy_dim:] = 0.0
+                else:
+                    adapted_weight[copy_dim:].normal_(0, 0.02)
+            
+            # adaptation_info = f"copied {copy_dim}, initialized {target_dim-copy_dim}"
+            # print(f"        ✓ {adaptation_info}")
+            return adapted_weight
+        
+        # For unsupported shapes, fall back to Xavier initialization
+        else:
+            print(f"         Unsupported shape adaptation, using Xavier initialization")
+            adapted_weight = torch.zeros(target_shape, dtype=pretrained_weight.dtype, device=pretrained_weight.device)
+            torch.nn.init.xavier_uniform_(adapted_weight)
+            return adapted_weight
+    
+    def _adapt_bias_tensor(self, pretrained_bias, target_shape, bias_name):
+        """Adapt bias tensors with appropriate initialization"""
+        if pretrained_bias.shape == target_shape:
+            return pretrained_bias.clone()
+            
+        #print(f"      Adapting {bias_name}: {pretrained_bias.shape} → {target_shape}")
+
+        target_dim = target_shape[0]
+        pretrained_dim = pretrained_bias.shape[0]
+        
+        adapted_bias = torch.zeros(target_shape, dtype=pretrained_bias.dtype, device=pretrained_bias.device)
+        
+        copy_dim = min(target_dim, pretrained_dim)
+        adapted_bias[:copy_dim] = pretrained_bias[:copy_dim]
+        
+        # Bias initialization for new elements is usually 0
+        if target_dim > pretrained_dim:
+            adapted_bias[copy_dim:] = 0.0
+
+        #print(f"        ✓ copied {copy_dim} bias elements, initialized {target_dim-copy_dim} to zero")
+        return adapted_bias
+    
+    def _copy_vit_layer_weights(self, pretrained_layer, custom_layer, layer_idx):
+        """Copy weights from pretrained ViT layer to custom layer"""
+        print(f"    Initializing layer {layer_idx} from ViT")
+        
+        try:
+            # Get pretrained attention weights (ViT structure)
+            pretrained_attn = pretrained_layer.attention.attention
+            custom_attn = custom_layer.self_attn
+            
+            # Adapt and copy Q, K, V weights
+            embed_dim = custom_attn.embed_dim
+            
+            with torch.no_grad():
+                # Adapt Q, K, V weights
+                q_adapted = self._adapt_weight_tensor(pretrained_attn.query.weight, (embed_dim, embed_dim), "Query weight")
+                k_adapted = self._adapt_weight_tensor(pretrained_attn.key.weight, (embed_dim, embed_dim), "Key weight")
+                v_adapted = self._adapt_weight_tensor(pretrained_attn.value.weight, (embed_dim, embed_dim), "Value weight")
+                
+                # Copy adapted weights to the combined in_proj_weight tensor
+                custom_attn.in_proj_weight[:embed_dim].copy_(q_adapted)
+                custom_attn.in_proj_weight[embed_dim:2*embed_dim].copy_(k_adapted)
+                custom_attn.in_proj_weight[2*embed_dim:].copy_(v_adapted)
+                
+                # Adapt and copy Q, K, V biases
+                q_bias_adapted = self._adapt_bias_tensor(pretrained_attn.query.bias, (embed_dim,), "Query bias")
+                k_bias_adapted = self._adapt_bias_tensor(pretrained_attn.key.bias, (embed_dim,), "Key bias")
+                v_bias_adapted = self._adapt_bias_tensor(pretrained_attn.value.bias, (embed_dim,), "Value bias")
+                
+                custom_attn.in_proj_bias[:embed_dim].copy_(q_bias_adapted)
+                custom_attn.in_proj_bias[embed_dim:2*embed_dim].copy_(k_bias_adapted)
+                custom_attn.in_proj_bias[2*embed_dim:].copy_(v_bias_adapted)
+                
+                # Adapt and copy output projection (ViT structure)
+                out_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.attention.output.dense.weight, 
+                    custom_attn.out_proj.weight.shape, 
+                    "Output projection weight"
+                )
+                out_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.attention.output.dense.bias,
+                    custom_attn.out_proj.bias.shape,
+                    "Output projection bias"
+                )
+                
+                custom_attn.out_proj.weight.copy_(out_weight_adapted)
+                custom_attn.out_proj.bias.copy_(out_bias_adapted)
+            
+            #print(f"      Successfully adapted and copied attention weights")
+
+            # Adapt and copy layer norm weights (ViT structure)
+            with torch.no_grad():
+                # First layer norm (before attention)
+                ln1_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.layernorm_before.weight,
+                    custom_layer.norm1.weight.shape,
+                    "LayerNorm1 weight"
+                )
+                ln1_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.layernorm_before.bias,
+                    custom_layer.norm1.bias.shape,
+                    "LayerNorm1 bias"
+                )
+                
+                custom_layer.norm1.weight.copy_(ln1_weight_adapted)
+                custom_layer.norm1.bias.copy_(ln1_bias_adapted)
+                
+                # Second layer norm (after attention)
+                ln2_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.layernorm_after.weight,
+                    custom_layer.norm2.weight.shape,
+                    "LayerNorm2 weight"
+                )
+                ln2_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.layernorm_after.bias,
+                    custom_layer.norm2.bias.shape,
+                    "LayerNorm2 bias"
+                )
+                
+                custom_layer.norm2.weight.copy_(ln2_weight_adapted)
+                custom_layer.norm2.bias.copy_(ln2_bias_adapted)
+            
+            # Copy feedforward weights (same structure as BERT)
+            self._copy_feedforward_weights(pretrained_layer, custom_layer)
+            
+            print(f"    ViT layer {layer_idx} initialization completed successfully")
+            
+        except Exception as e:
+            print(f"      Error adapting ViT layer {layer_idx}: {e}")
+            self._fallback_xavier_init(custom_layer)
+    
+    def _copy_bert_layer_weights(self, pretrained_layer, custom_layer, layer_idx):
+        """Copy weights from pretrained BERT layer to custom layer"""
+        print(f"    Initializing layer {layer_idx} from BERT")
+        
+        try:
+            # Get pretrained attention weights (BERT structure)
+            pretrained_attn = pretrained_layer.attention.self  # BERT uses .self
+            custom_attn = custom_layer.self_attn
+            
+            # Adapt and copy Q, K, V weights
+            embed_dim = custom_attn.embed_dim
+            
+            with torch.no_grad():
+                # Adapt Q, K, V weights
+                q_adapted = self._adapt_weight_tensor(pretrained_attn.query.weight, (embed_dim, embed_dim), "Query weight")
+                k_adapted = self._adapt_weight_tensor(pretrained_attn.key.weight, (embed_dim, embed_dim), "Key weight")
+                v_adapted = self._adapt_weight_tensor(pretrained_attn.value.weight, (embed_dim, embed_dim), "Value weight")
+                
+                # Copy adapted weights to the combined in_proj_weight tensor
+                custom_attn.in_proj_weight[:embed_dim].copy_(q_adapted)
+                custom_attn.in_proj_weight[embed_dim:2*embed_dim].copy_(k_adapted)
+                custom_attn.in_proj_weight[2*embed_dim:].copy_(v_adapted)
+                
+                # Adapt and copy Q, K, V biases
+                q_bias_adapted = self._adapt_bias_tensor(pretrained_attn.query.bias, (embed_dim,), "Query bias")
+                k_bias_adapted = self._adapt_bias_tensor(pretrained_attn.key.bias, (embed_dim,), "Key bias")
+                v_bias_adapted = self._adapt_bias_tensor(pretrained_attn.value.bias, (embed_dim,), "Value bias")
+                
+                custom_attn.in_proj_bias[:embed_dim].copy_(q_bias_adapted)
+                custom_attn.in_proj_bias[embed_dim:2*embed_dim].copy_(k_bias_adapted)
+                custom_attn.in_proj_bias[2*embed_dim:].copy_(v_bias_adapted)
+                
+                # Adapt and copy output projection (BERT structure)
+                out_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.attention.output.dense.weight,  # BERT path
+                    custom_attn.out_proj.weight.shape, 
+                    "Output projection weight"
+                )
+                out_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.attention.output.dense.bias,   # BERT path
+                    custom_attn.out_proj.bias.shape,
+                    "Output projection bias"
+                )
+                
+                custom_attn.out_proj.weight.copy_(out_weight_adapted)
+                custom_attn.out_proj.bias.copy_(out_bias_adapted)
+            
+            # Adapt and copy layer norm weights (BERT structure)
+            with torch.no_grad():
+                # BERT has attention.output.LayerNorm and output.LayerNorm
+                ln1_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.attention.output.LayerNorm.weight,  # BERT path
+                    custom_layer.norm1.weight.shape,
+                    "LayerNorm1 weight"
+                )
+                ln1_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.attention.output.LayerNorm.bias,   # BERT path
+                    custom_layer.norm1.bias.shape,
+                    "LayerNorm1 bias"
+                )
+                
+                custom_layer.norm1.weight.copy_(ln1_weight_adapted)
+                custom_layer.norm1.bias.copy_(ln1_bias_adapted)
+                
+                # Second layer norm
+                ln2_weight_adapted = self._adapt_weight_tensor(
+                    pretrained_layer.output.LayerNorm.weight,           # BERT path
+                    custom_layer.norm2.weight.shape,
+                    "LayerNorm2 weight"
+                )
+                ln2_bias_adapted = self._adapt_bias_tensor(
+                    pretrained_layer.output.LayerNorm.bias,            # BERT path
+                    custom_layer.norm2.bias.shape,
+                    "LayerNorm2 bias"
+                )
+                
+                custom_layer.norm2.weight.copy_(ln2_weight_adapted)
+                custom_layer.norm2.bias.copy_(ln2_bias_adapted)
+            
+            # Copy feedforward weights (same structure as ViT)
+            self._copy_feedforward_weights(pretrained_layer, custom_layer)
+            
+            print(f"    BERT layer {layer_idx} initialization completed successfully")
+            
+        except Exception as e:
+            print(f"      Error adapting BERT layer {layer_idx}: {e}")
+            self._fallback_xavier_init(custom_layer)
+    
+    def _copy_feedforward_weights(self, pretrained_layer, custom_layer):
+        """Copy feedforward weights (same structure for both ViT and BERT)"""
+        pretrained_ff = pretrained_layer.intermediate
+        pretrained_output = pretrained_layer.output
+        custom_ff = custom_layer.linear1
+        custom_output = custom_layer.linear2
+        
+        with torch.no_grad():
+            # First feedforward layer
+            ff1_weight_adapted = self._adapt_weight_tensor(
+                pretrained_ff.dense.weight,
+                custom_ff.weight.shape,
+                "Feedforward1 weight"
+            )
+            ff1_bias_adapted = self._adapt_bias_tensor(
+                pretrained_ff.dense.bias,
+                custom_ff.bias.shape,
+                "Feedforward1 bias"
+            )
+            
+            custom_ff.weight.copy_(ff1_weight_adapted)
+            custom_ff.bias.copy_(ff1_bias_adapted)
+            
+            # Second feedforward layer (output projection)
+            ff2_weight_adapted = self._adapt_weight_tensor(
+                pretrained_output.dense.weight,
+                custom_output.weight.shape,
+                "Feedforward2 weight"
+            )
+            ff2_bias_adapted = self._adapt_bias_tensor(
+                pretrained_output.dense.bias,
+                custom_output.bias.shape,
+                "Feedforward2 bias"
+            )
+            
+            custom_output.weight.copy_(ff2_weight_adapted)
+            custom_output.bias.copy_(ff2_bias_adapted)
+    
+    
+    def _fallback_xavier_init(self, custom_layer):
+        """Fallback initialization using Xavier uniform"""
+        print(f"      Applying Xavier initialization fallback")
+        try:
+            with torch.no_grad():
+                for param in custom_layer.parameters():
+                    if len(param.shape) >= 2:
+                        torch.nn.init.xavier_uniform_(param)
+                    else:
+                        torch.nn.init.zeros_(param)
+            print(f"      Xavier initialization completed for layer {layer_idx}")
+        except Exception as fallback_error:
+            print(f"      Even fallback initialization failed: {fallback_error}")
+    
+    def _parse_covariates_tensor(self, covariates_tensor):
+        """Parse the concatenated covariates tensor into individual components"""
+        if covariates_tensor is None or covariates_tensor.numel() == 0:
+            return {}
+        
+        covariates_dict = {}
+        start_idx = 0
+        
+        # Extract PCs (6 dimensions)
+        if hasattr(self.covariate_embedder, 'use_pcs') and self.covariate_embedder.use_pcs:
+            if start_idx + 6 <= covariates_tensor.size(1):
+                covariates_dict['pcs'] = covariates_tensor[:, start_idx:start_idx+6]
+                start_idx += 6
+            else:
+                print(f"DEBUG: Cannot extract PCs - need indices {start_idx}:{start_idx+6} but tensor only has {covariates_tensor.size(1)} features")
+        
+        # Extract age (1 dimension)
+        if hasattr(self.covariate_embedder, 'use_age') and self.covariate_embedder.use_age:
+            if start_idx < covariates_tensor.size(1):
+                covariates_dict['age'] = covariates_tensor[:, start_idx]
+                start_idx += 1
+            else:
+                print(f"DEBUG: Cannot extract age - need index {start_idx} but tensor only has {covariates_tensor.size(1)} features")
+                
+        # Extract gender (1 dimension)
+        if hasattr(self.covariate_embedder, 'use_gender') and self.covariate_embedder.use_gender:
+            if start_idx < covariates_tensor.size(1):
+                covariates_dict['gender'] = covariates_tensor[:, start_idx]
+                start_idx += 1
+            else:
+                print(f"DEBUG: Cannot extract gender - need index {start_idx} but tensor only has {covariates_tensor.size(1)} features")
+                
+        # Extract BMI (1 dimension)
+        if hasattr(self.covariate_embedder, 'use_bmi') and self.covariate_embedder.use_bmi:
+            if start_idx < covariates_tensor.size(1):
+                covariates_dict['bmi'] = covariates_tensor[:, start_idx]
+                start_idx += 1
+            else:
+                print(f"DEBUG: Cannot extract BMI - need index {start_idx} but tensor only has {covariates_tensor.size(1)} features")
+        
+        return covariates_dict
+        
     def forward(self, x, covariates=None):
         """
         Args:
             x: Tensor of shape (batch_size, channels, seq_len) from conv layers
             covariates: Tensor of shape (batch_size, num_covariates) or None
         Returns:
-            pooled features based on strategy
+            If use_cls_token=True: cls_token features [batch_size, transformer_dim]
+            If use_cls_token=False: pooled features [batch_size, transformer_dim]
         """
         batch_size, channels, seq_len = x.shape
         
         # Reshape: (batch_size, channels, seq_len) → (batch_size, seq_len, channels)
         x = x.transpose(1, 2)
         
-        # Project to Mamba dimension if needed
+        # Project to transformer dimension if needed
         if self.input_projection is not None:
-            x = self.input_projection(x)  # [batch_size, seq_len, d_model]
+            x = self.input_projection(x)  # [batch_size, seq_len, transformer_dim]
+        
+        # Add class token if enabled
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(batch_size, -1, -1)  # [batch_size, 1, transformer_dim]
+            x = torch.cat([cls_tokens, x], dim=1)  # [batch_size, 1+seq_len, transformer_dim]
+            seq_len += 1  # Account for cls token
         
         # Add covariate tokens if enabled
+        covariate_seq_len = 0
         if self.use_covariate_tokens and covariates is not None:
-            covariate_tokens = self.covariate_embedder(covariates)
-            if covariate_tokens is not None:
-                x = torch.cat([covariate_tokens, x], dim=1)  # [batch_size, seq_len+1, d_model]
-        
-        # Apply Mamba layers
-        for i, mamba_layer in enumerate(self.mamba_layers):
-            residual = x
-            
-            # Apply layer norm if enabled
-            if self.use_norm:
-                x = self.layer_norms[i](x)
-            
-            # Apply Mamba layer
-            x = mamba_layer(x)
-            
-            # Residual connection
-            x = x + residual
-        
-        # Apply final pooling based on strategy
-        if self.pooling_strategy in ["chunked", "multiscale", "multihead", "conv", "hierarchical"]:
-            pooled_features = self.custom_pooling(x)
-        elif self.pooling_strategy == "mean":
-            pooled_features = torch.mean(x, dim=1)  # [batch_size, d_model]
-        elif self.pooling_strategy == "max":
-            pooled_features, _ = torch.max(x, dim=1)  # [batch_size, d_model]
-        elif self.pooling_strategy == "attention":
-            pooled_features = self.attention_pooling(x)  # [batch_size, d_model]
-        elif self.pooling_strategy == "concat":
-            pooled_features = x  # Keep full sequence
-        else:
-            # Fallback to mean pooling
-            print(f"Warning: Unknown pooling strategy '{self.pooling_strategy}', using mean pooling")
-            pooled_features = torch.mean(x, dim=1)
-        
-        return pooled_features
+            covariates_dict = self._parse_covariates_tensor(covariates)
 
-class MultilabelGenomicMambaModel(nn.Module):
+            covariate_result = self.covariate_embedder(covariates_dict)
+            
+            if covariate_result is not None:
+                covariate_tokens, _ = covariate_result
+                if covariate_tokens is not None:
+                    x = torch.cat([x, covariate_tokens], dim=1)  # [batch_size, seq_len+num_cov_tokens, transformer_dim]
+                    covariate_seq_len = covariate_tokens.size(1)
+        
+        # Reshape for transformer: (batch_size, seq_len, features) → (seq_len, batch_size, features)
+        x = x.transpose(0, 1) # (seq_len, batch_size, transformer_dim)
+        
+        # Add positional encoding
+        if self.use_positional_encoding:
+            x = self.pos_encoding(x)
+        
+        # Apply transformer layers
+        x = self.transformer_encoder(x)  # (total_seq_len, batch_size, transformer_dim)
+        
+        # Apply layer normalization
+        x = self.layer_norm(x)
+        
+        # Extract features for classification
+        if self.use_cls_token:
+            # Use cls token (first token) for classification
+            cls_features = x[0]  # [batch_size, transformer_dim]
+            return cls_features
+        else:
+            # Reshape back to batch-first for pooling
+            x_batch_first = x.transpose(0, 1)
+            
+            # Apply pooling strategies
+            if self.pooling_strategy in ["chunked", "multiscale", "multihead", "conv", "hierarchical"]:
+                pooled_features = self.custom_pooling(x_batch_first)
+            elif self.pooling_strategy == "mean":
+                pooled_features = torch.mean(x_batch_first, dim=1)
+            elif self.pooling_strategy == "max":
+                pooled_features, _ = torch.max(x_batch_first, dim=1)
+            elif self.pooling_strategy == "attention":
+                pooled_features = self.attention_pooling(x_batch_first)
+            elif self.pooling_strategy == "concat":
+                pooled_features = x_batch_first
+            else:
+                print(f"Warning: Unknown pooling strategy '{self.pooling_strategy}', using mean pooling")
+                pooled_features = torch.mean(x_batch_first, dim=1)
+            
+            return pooled_features
+
+class MultilabelGenotypeModel(nn.Module):
     def __init__(self, input_size, num_diseases, kernel_sizes, stride, conv_channels, fc_layers, act, dropout_rate, 
                  use_covariates=True, use_age=True, use_gender=True, use_bmi=True, num_covariates=6, use_pooling=True, pool_size=16, pool_type="max",
                  use_multi_scale=True, use_disease_attention=True, use_separate_heads=True, 
                  attention_heads=8, attention_dim=256, multi_scale_kernels=None, multi_scale_strides=None,
                  multi_scale_fusion="cross_scale", multi_scale_mode="progressive", hardcoded_kernels=None, hardcoded_strides=None,
                  use_pointwise_conv=False, pointwise_channels=16,
-                 use_mamba=True, mamba_layers=4, mamba_d_model=256, mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, mamba_dropout=0.1, use_mamba_norm=True,
-                 use_covariate_tokens=False, covariate_embed_dim=64, pooling_strategy="mean", pooling_kwargs=None):
+                 use_transformer=False, transformer_layers=2, transformer_heads=4, transformer_dim=256, 
+                 transformer_ff_dim=1024, transformer_dropout=0.1, use_positional_encoding=True, max_seq_len=10000,
+                 pretrained_model_type="auto",
+                 init_from_pretrained=False, pretrained_model_name="WinKawaks/vit-small-patch16-224",
+                 init_layers_fraction=1.0, layer_init_strategy="middle", custom_layer_indices="",
+                 use_cls_token=True, use_covariate_tokens=False, covariate_embed_dim=64, covariate_token_strategy="separate", 
+                 pooling_strategy="mean", pooling_kwargs=None):
 
-        super(MultilabelGenomicMambaModel, self).__init__()
+        super(MultilabelGenotypeModel, self).__init__()
         self.input_channels = 3
         self.use_covariates = use_covariates
         self.use_age = use_age
@@ -1416,18 +2092,28 @@ class MultilabelGenomicMambaModel(nn.Module):
         self.use_pointwise_conv = use_pointwise_conv
         self.pointwise_channels = pointwise_channels
 
-        # Store Mamba parameters
-        self.use_mamba = use_mamba
-        self.mamba_layers = mamba_layers
-        self.mamba_d_model = mamba_d_model
-        self.mamba_d_state = mamba_d_state
-        self.mamba_d_conv = mamba_d_conv
-        self.mamba_expand = mamba_expand
-        self.mamba_dropout = mamba_dropout
-        self.use_mamba_norm = use_mamba_norm
+        # Store transformer parameters
+        self.use_transformer = use_transformer
+        self.transformer_layers = transformer_layers
+        self.transformer_heads = transformer_heads
+        self.transformer_dim = transformer_dim
+        self.transformer_ff_dim = transformer_ff_dim
+        self.transformer_dropout = transformer_dropout
+        self.use_positional_encoding = use_positional_encoding
+        self.max_seq_len = max_seq_len
 
+        # Store pretrained initialization parameters
+        self.init_from_pretrained = init_from_pretrained
+        self.pretrained_model_name = pretrained_model_name
+        self.pretrained_model_type = pretrained_model_type
+        self.init_layers_fraction = init_layers_fraction
+        self.layer_init_strategy = layer_init_strategy
+        self.custom_layer_indices = custom_layer_indices
+
+        self.use_cls_token = use_cls_token
         self.use_covariate_tokens = use_covariate_tokens
         self.covariate_embed_dim = covariate_embed_dim
+        self.covariate_token_strategy = covariate_token_strategy
 
         # Store multi-scale parameters
         self.multi_scale_kernels = multi_scale_kernels if multi_scale_kernels is not None else [15, 63, 255]
@@ -1509,7 +2195,7 @@ class MultilabelGenomicMambaModel(nn.Module):
             print("Not using final adaptive pooling")
             self.conv_layers = conv_layers
         
-        # Calculate output size after convolutions (but before Mamba)
+        # Calculate output size after convolutions (but before transformer)
         self.conv_output_info = self._get_conv_output_info(input_size)
         conv_output_size = self.conv_output_info['flattened_size']
         conv_seq_len = self.conv_output_info['seq_len']
@@ -1517,60 +2203,92 @@ class MultilabelGenomicMambaModel(nn.Module):
         
         print(f"Convolutional output: channels={conv_channels_out}, seq_len={conv_seq_len}, flattened_size={conv_output_size}")
         
-        # Add Mamba layers if enabled
-        if self.use_mamba:
-            print(f"\n  Adding Mamba Processing:")
+        # Add transformer layers if enabled
+        if self.use_transformer:
+            print(f"\n  Adding Transformer Processing:")
+            print(f"  - Class token: {'Enabled' if use_cls_token else 'Disabled (using global pooling)'}")
             print(f"  - Covariate tokens: {'Enabled' if use_covariate_tokens else 'Disabled (concatenate at end)'}")
-            print(f"  - Input to Mamba: (batch_size, {conv_channels_out}, {conv_seq_len})")
+            if use_covariate_tokens:
+                print(f"  - Covariate strategy: {covariate_token_strategy}")
+            if not use_cls_token:
+                print(f"  - Pooling strategy: {pooling_strategy}")
+
+            print(f"  - Initialize from pretrained: {init_from_pretrained}")
+            if init_from_pretrained:
+                print(f"  - Pretrained model: {pretrained_model_name}")
+                #print(f"  - Layers to initialize: {init_layers_fraction * 100:.1f}%")
             
+            print(f"  - Input to transformer: (batch_size, {conv_channels_out}, {conv_seq_len})")
+
             # Get pooling configuration
             pooling_kwargs = pooling_kwargs or {}
+    
             
-            self.mamba_block = GenomicMambaBlock(
-                input_dim=conv_channels_out,
-                d_model=mamba_d_model,
-                d_state=mamba_d_state,
-                d_conv=mamba_d_conv,
-                expand=mamba_expand,
-                num_layers=mamba_layers,
-                dropout=mamba_dropout,
-                use_norm=use_mamba_norm,
-                use_covariate_tokens=use_covariate_tokens,
-                covariate_embed_dim=covariate_embed_dim,
-                pooling_strategy=pooling_strategy,
-                use_age=use_age,
-                use_gender=use_gender,
-                use_bmi=use_bmi,
-                use_pcs=use_covariates,
-                **pooling_kwargs  # Pass pooling parameters
+            self.transformer_block = GenomicTransformerBlock(
+            input_dim=conv_channels_out,
+            transformer_dim=transformer_dim,
+            num_layers=transformer_layers,
+            num_heads=transformer_heads,
+            ff_dim=transformer_ff_dim,
+            dropout=transformer_dropout,
+            use_positional_encoding=use_positional_encoding,
+            max_seq_len=max_seq_len,
+            use_cls_token=use_cls_token,
+            use_covariate_tokens=use_covariate_tokens,
+            covariate_embed_dim=covariate_embed_dim,
+            covariate_token_strategy=covariate_token_strategy,
+            pooling_strategy=pooling_strategy,
+            use_age=use_age,
+            use_gender=use_gender,
+            use_bmi=use_bmi,
+            use_pcs=use_covariates,
+            # Pretrained initialization parameters
+            init_from_pretrained=init_from_pretrained,
+            pretrained_model_name=pretrained_model_name,
+            pretrained_model_type=pretrained_model_type,
+            init_layers_fraction=init_layers_fraction,
+            layer_init_strategy=layer_init_strategy,
+            custom_layer_indices=custom_layer_indices,
+            **pooling_kwargs  # Pass pooling parameters
             )
             
-            # # Mamba output is always pooled to [batch_size, d_model]
-            # feature_size_for_fc = mamba_d_model
-            # print(f"  - Mamba output: (batch_size, {mamba_d_model}) from {pooling_strategy} pooling")
-
-            # Calculate feature size for FC layers
-            if use_covariate_tokens:
-                if pooling_strategy == 'concat':
-                    feature_size_for_fc = (conv_seq_len + 1) * mamba_d_model
-                    print(f"  - Mamba output: (batch_size, {conv_seq_len+1}, {mamba_d_model})")
-                    print(f"  - Flattened size after mamba: {feature_size_for_fc:,}")
+            # Calculate output size after transformer
+            #if use_cls_token or use_covariate_tokens:
+            if use_cls_token or use_covariate_tokens:
+                if use_covariate_tokens and self.transformer_block.pooling_strategy == 'concat' and self.transformer_block.covariate_token_strategy == 'combined':
+                    # Transformer returns [batch_size, seq_len+1, transformer_dim], needs flattening
+                    feature_size_for_fc = (conv_seq_len + 1) * transformer_dim
+                    print(f"  - Transformer output: (batch_size, {conv_seq_len+1}, {transformer_dim})")
+                    print(f"  - Flattened size after transformer: {feature_size_for_fc:,}")
+                
+                elif use_covariate_tokens and self.transformer_block.pooling_strategy == 'concat' and self.transformer_block.covariate_token_strategy == 'separate':
+                    # Transformer returns [batch_size, seq_len+4, transformer_dim], needs flattening
+                    feature_size_for_fc = (conv_seq_len + 4) * transformer_dim
+                    
+                    print(f"  - Transformer output: (batch_size, {conv_seq_len+4}, {transformer_dim})")
+                    print(f"  - Flattened size after transformer: {feature_size_for_fc:,}")
+                
                 else:
-                    feature_size_for_fc = self.mamba_block.final_output_dim or mamba_d_model
-                    print(f"  - Mamba output: (batch_size, {feature_size_for_fc}) from {pooling_strategy} pooling")
+                    feature_size_for_fc = self.transformer_block.final_output_dim or transformer_dim
+                    print(f"  - Transformer output: (batch_size, {transformer_dim}) from cls token or Max/Avg pooling")
             else:
-                if pooling_strategy == 'concat':
-                    feature_size_for_fc = conv_seq_len * mamba_d_model
-                    print(f"  - Mamba output: (batch_size, {conv_seq_len}, {mamba_d_model})")
-                    print(f"  - Flattened size after mamba: {feature_size_for_fc:,}")
+                if self.transformer_block.pooling_strategy == 'concat':
+                    # Transformer returns [batch_size, seq_len, transformer_dim], needs flattening
+                    feature_size_for_fc = conv_seq_len * transformer_dim
+                    print(f"  - Transformer output: (batch_size, {conv_seq_len}, {transformer_dim})")
+                    print(f"  - Flattened size after transformer: {feature_size_for_fc:,}")
+                
                 else:
-                    feature_size_for_fc = self.mamba_block.final_output_dim or mamba_d_model
-                    print(f"  - Mamba output: (batch_size, {feature_size_for_fc}) from {pooling_strategy} pooling")
+                    # Transformer returns [batch_size, transformer_dim] directly
+                    feature_size_for_fc = self.transformer_block.final_output_dim or transformer_dim
+                    
+                    print(f"  - Transformer output: (batch_size, {feature_size_for_fc}) from {pooling_strategy} pooling")
+                    
         else:
-            print(f"\n  Mamba processing: Disabled")
-            self.mamba_block = None
+            print(f"\n  Transformer processing: Disabled")
+            self.transformer_block = None
             feature_size_for_fc = conv_output_size
-          
+        
         # Disease-specific attention mechanism
         if self.use_disease_attention:
             self.attention_input_dim = feature_size_for_fc
@@ -1632,19 +2350,22 @@ class MultilabelGenomicMambaModel(nn.Module):
         architecture_info.append(f"Final pointwise convolutions: {use_pointwise_conv}")
         if use_pointwise_conv:
             architecture_info.append(f"Final pointwise channels: {pointwise_channels}") 
-        # Mamba info
-        architecture_info.append(f"Mamba layers: {use_mamba}")
-        if use_mamba:
-            architecture_info.append(f"Mamba: {mamba_layers} layers, d_model={mamba_d_model}, d_state={mamba_d_state}")
+        # Transformer info
+        architecture_info.append(f"Transformer layers: {use_transformer}")
+        if use_transformer:
+            architecture_info.append(f"Enhanced transformer: {transformer_layers} layers, {transformer_heads} heads, dim={transformer_dim}")
+            architecture_info.append(f"Class token: {use_cls_token}")
             architecture_info.append(f"Covariate tokens: {use_covariate_tokens}")
-            architecture_info.append(f"Pooling strategy: {pooling_strategy}")
+            architecture_info.append(f"Initialize from pretrained: {init_from_pretrained}")
+            if init_from_pretrained:
+                architecture_info.append(f"Pretrained model: {pretrained_model_name}")
         architecture_info.append(f"Disease-specific attention: {use_disease_attention}")
         architecture_info.append(f"Separate disease heads: {use_separate_heads}")
         architecture_info.append(f"Using PC's: {use_covariates}, age: {use_age}, gender: {use_gender}, BMI:{use_bmi}")
         architecture_info.append(f"Using final pooling: {use_pooling} ({pool_type} pool, size={pool_size})" if use_pooling else "Using final pooling: False")
         architecture_info.append(f"Multi-scale internal pooling: {pool_type} (for length standardization)" if use_multi_scale else "Internal pooling: N/A")
         
-        print(f"\nGenomicMambaModel initialized:")
+        print(f"\nEnhanced MultilabelGenotypeModel initialized:")
         for info in architecture_info:
             print(f"  - {info}")
         
@@ -1712,33 +2433,6 @@ class MultilabelGenomicMambaModel(nn.Module):
                   f"channels {channels_in} → {channels_out}")
         return output_length
 
-    def _get_layer_kernels_and_strides(self, layer_idx):
-        """Get kernels and strides for a specific layer based on mode"""
-        if self.multi_scale_mode == "hardcoded":
-            # Use hardcoded values
-            return self.hardcoded_kernels[layer_idx], self.hardcoded_strides[layer_idx]
-        else:
-            # Use progressive reduction (original behavior)
-            if layer_idx == 0:
-                return self.multi_scale_kernels.copy(), self.multi_scale_strides.copy()
-            else:
-                scale_kernels = []
-                scale_strides = []
-                
-                for j in range(len(self.multi_scale_kernels)):
-                    # Calculate kernel: original_kernel // (2^i)
-                    new_kernel = max(1, self.multi_scale_kernels[j] // (2 ** layer_idx))
-                    # Ensure kernel is odd for proper padding
-                    if new_kernel % 2 == 0:
-                        new_kernel += 1
-                    
-                    # Calculate stride: original_stride // (2^i)
-                    new_stride = max(1, self.multi_scale_strides[j] // (2 ** layer_idx))
-                    
-                    scale_kernels.append(new_kernel)
-                    scale_strides.append(new_stride)
-                
-                return scale_kernels, scale_strides
 
     def _create_multi_scale_conv_layers_cross_scale(self, conv_channels, kernel_sizes, stride, dropout_rate, act):
         """Create multi-scale convolutional layers with cross-scale fusion"""
@@ -1795,6 +2489,7 @@ class MultilabelGenomicMambaModel(nn.Module):
                 branch_outputs.append(output_length)
             
             # After multi-scale block, length is minimum of all branches
+            #final_length = min(branch_outputs)
             final_length = branch_outputs[1] if len(branch_outputs) >=2 else branch_outputs[0]
             print(f"    After concatenation: sequence length = {final_length:,}")
             
@@ -1866,6 +2561,7 @@ class MultilabelGenomicMambaModel(nn.Module):
             
             if is_final_layer:
                 # Final layer: show concatenation info
+                #final_length = min(branch_lengths)
                 final_length = branch_lengths[1] if len(branch_lengths) >=2 else branch_lengths[0]
                 print(f"    Final concatenation: min sequence length = {final_length:,}")
                 
@@ -1873,7 +2569,7 @@ class MultilabelGenomicMambaModel(nn.Module):
                     print(f"    Total output channels: {len(self.multi_scale_kernels)} * {self.pointwise_channels} = {len(self.multi_scale_kernels) * self.pointwise_channels} (after final pointwise)")
                 else:
                     print(f"    Total output channels: {len(self.multi_scale_kernels)} * {out_channels} = {len(self.multi_scale_kernels) * out_channels}")
-               # print(f"    Final layer {self.pool_type} pooling applied for length standardization")
+                print(f"    Final layer {self.pool_type} pooling applied for length standardization")
             
             # Create parallel multi-scale block for this layer
             parallel_block = ParallelMultiScaleConvBlock(
@@ -1941,6 +2637,35 @@ class MultilabelGenomicMambaModel(nn.Module):
         
         print(f"  Final sequence length after standard conv layers: {current_length:,}")
         return nn.Sequential(*layers)
+    
+    def _get_layer_kernels_and_strides(self, layer_idx):
+        """Get kernels and strides for a specific layer based on mode"""
+        if self.multi_scale_mode == "hardcoded":
+            # Use hardcoded values
+            return self.hardcoded_kernels[layer_idx], self.hardcoded_strides[layer_idx]
+        else:
+            # Use progressive reduction (original behavior)
+            if layer_idx == 0:
+                return self.multi_scale_kernels.copy(), self.multi_scale_strides.copy()
+            else:
+                scale_kernels = []
+                scale_strides = []
+                
+                for j in range(len(self.multi_scale_kernels)):
+                    # Calculate kernel: original_kernel // (2^i)
+                    new_kernel = max(1, self.multi_scale_kernels[j] // (2 ** layer_idx))
+                    # Ensure kernel is odd for proper padding
+                    if new_kernel % 2 == 0:
+                        new_kernel += 1
+                    
+                    # Calculate stride: original_stride // (2^i)
+                    new_stride = max(1, self.multi_scale_strides[j] // (2 ** layer_idx))
+                    #new_stride = max(1, self.multi_scale_strides[j] // (1 ** layer_idx))
+                    
+                    scale_kernels.append(new_kernel)
+                    scale_strides.append(new_stride)
+                
+                return scale_kernels, scale_strides
 
     def _get_conv_output_info(self, input_size):
         """Calculate output size after convolution layers"""
@@ -1971,21 +2696,27 @@ class MultilabelGenomicMambaModel(nn.Module):
         # Convolutional processing (includes final pooling if enabled)
         x = self.conv_layers(x)  # Shape: (batch_size, channels, seq_len)
         
-        # Mamba processing if enabled
-        if self.use_mamba:
+        # Transformer processing if enabled
+        if self.use_transformer:
             if self.use_covariate_tokens:
-                # Process covariates as tokens within Mamba
-                x = self.mamba_block(x, covariates)  # Returns [batch_size, d_model]
-
-                if self.mamba_block.pooling_strategy == 'concat':
+                # Process covariates as tokens within transformer
+                x = self.transformer_block(x, covariates)  # Returns [batch_size, transformer_dim]
+                
+                # For cls token: x is already the right shape
+                # For pooling: x is already pooled
+                if self.transformer_block.pooling_strategy == 'concat':
                     x = x.reshape(x.size(0), -1)
+                
             else:
-                # Mamba without covariate tokens
-                x = self.mamba_block(x)  # Transform: (batch_size, channels, seq_len) -> (batch_size, d_model)
-                if self.mamba_block.pooling_strategy == 'concat':
-                    x = x.reshape(x.size(0), -1)
+                # Original behavior: transformer without covariate tokens
+                x = self.transformer_block(x)  # Transform: (batch_size, channels, seq_len) -> (batch_size, seq_len, transformer_dim) or (batch_size, transformer_dim) if cls token
+                
+                # Flatten transformer output for fully connected layers if not using cls token
+                if not self.use_cls_token and self.transformer_block.pooling_strategy == 'concat':
+                    x = x.reshape(x.size(0), -1) # [batch_size, seq_len * transformer_dim]
+                # If using cls token, x is already [batch_size, transformer_dim]
         else:
-            # No Mamba: flatten conv output for fully connected layers
+            # No transformer: flatten conv output for fully connected layers
             x = x.reshape(x.size(0), -1)  # [batch_size, flattened_features]
         
         # Disease-specific attention processing
@@ -2126,7 +2857,7 @@ def train_multilabel_model(model, dataloaders, criterion, optimizer, scheduler, 
                          use_rotation=False, train_subjects=None, test_subjects=None, 
                          phenotype_data=None, target_ratio=5, batch_size=5, 
                          args=None):
-
+                          
     print(f"Training multilabel model on device: {device}")
     print(f"Disease labels: {disease_labels}")
     print(f"Starting with initial best loss: {initial_best_loss:.6f}")
@@ -2159,7 +2890,7 @@ def train_multilabel_model(model, dataloaders, criterion, optimizer, scheduler, 
     # Add rotation info tracking
     if 'rotation_info' not in history:
         history['rotation_info'] = []
-        
+
     # Verify history structure is complete
     required_keys = ['train_loss', 'test_loss', 'learning_rates']
     for disease in disease_labels:
@@ -2237,10 +2968,15 @@ def train_multilabel_model(model, dataloaders, criterion, optimizer, scheduler, 
                 print(f"{'='*80}\n")
             else:
                 print(f"\nEpoch {epoch} - Using dataloader created in main() (no recreation needed)")
+
+
+        # Store learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        history['learning_rates'].append(current_lr)
         
         # Each epoch has training and validation phase
         for phase in ['train', 'test']:
-            start_time = time.time()
+            start_time = time.time()            
             if phase == 'train':
                 model.train()
             else:
@@ -2528,8 +3264,10 @@ def train_multilabel_model(model, dataloaders, criterion, optimizer, scheduler, 
             cleanup_old_checkpoints(checkpoint_dir, keep_last_n)
 
     print(f'Training completed. Best test loss: {best_loss:.4f}')
+
     # Load best model
     model.load_state_dict(best_model_wts)
+
     # Compute final metrics
     final_metrics = compute_final_metrics(phase_labels, phase_preds, disease_labels)
 
@@ -2734,7 +3472,7 @@ def plot_multilabel_metrics(history, disease_labels, save_dir, final_metrics=Non
     plt.legend()
     plt.grid(alpha=0.3)
     
-    plt.suptitle('Multilabel Disease Prediction with Mamba Model Performance', fontsize=20)
+    plt.suptitle('Enhanced Multilabel Disease Prediction Model Performance', fontsize=20)
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     
     plt.savefig(os.path.join(plots_dir, 'combined_metrics_plot.png'), dpi=300, bbox_inches='tight')
@@ -2915,10 +3653,7 @@ def get_scheduler(scheduler_name, optimizer, args, train_subjects):
         return optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=10, 
                                                     factor=0.1, threshold=0.0001)
     elif scheduler_name == "cosine":
-        effective_epochs = min(args.epochs, args.patience + 10)  # Estimate actual training length
-        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.final_lr)
-    elif scheduler_name == "cosine_warmup":
-        return optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=args.final_lr)
+        return optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
     elif scheduler_name == "step":
         return optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
     elif scheduler_name == "multistep":
@@ -2929,7 +3664,7 @@ def get_scheduler(scheduler_name, optimizer, args, train_subjects):
         raise ValueError(f"Unknown scheduler type: {scheduler_name}")
 
 def main():
-    print("Starting multilabel disease prediction model with Mamba...")
+    print("Starting multilabel disease prediction model...")
     
     torch.manual_seed(42)
     np.random.seed(42)
@@ -3012,7 +3747,7 @@ def main():
     pooling_kwargs = get_pooling_kwargs(args)
 
     # Create model
-    model = MultilabelGenomicMambaModel(
+    model = MultilabelGenotypeModel(
         input_size=input_size,
         num_diseases=len(disease_labels),
         kernel_sizes=args.kernel_sizes,
@@ -3042,41 +3777,42 @@ def main():
         hardcoded_strides=args.hardcoded_strides,
         use_pointwise_conv=bool(args.use_pointwise_conv),
         pointwise_channels=args.pointwise_channels,
-        use_mamba=bool(args.use_mamba),
-        mamba_layers=args.mamba_layers,
-        mamba_d_model=args.mamba_d_model,
-        mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv,
-        mamba_expand=args.mamba_expand,
-        mamba_dropout=args.mamba_dropout,
-        use_mamba_norm=bool(args.use_mamba_norm),
+        use_transformer=bool(args.use_transformer),
+        transformer_layers=args.transformer_layers,
+        transformer_heads=args.transformer_heads,
+        transformer_dim=args.transformer_dim,
+        transformer_ff_dim=args.transformer_ff_dim,
+        transformer_dropout=args.transformer_dropout,
+        use_positional_encoding=bool(args.use_positional_encoding),
+        max_seq_len=args.max_seq_len,
+        init_from_pretrained=bool(args.init_from_pretrained),
+        pretrained_model_name=args.pretrained_model_name,
+        init_layers_fraction=args.init_layers_fraction,
+        layer_init_strategy=args.layer_init_strategy,
+        custom_layer_indices=args.custom_layer_indices,
+        use_cls_token=bool(args.use_cls_token),
         use_covariate_tokens=bool(args.use_covariate_tokens),
         covariate_embed_dim=args.covariate_embed_dim,
+        covariate_token_strategy=args.covariate_token_strategy,
         pooling_strategy=args.pooling_strategy,
-        pooling_kwargs=pooling_kwargs 
+        pooling_kwargs=pooling_kwargs
     )
 
     model = model.to(device)
     print("Model created and moved to device")
 
-    # Load EPIC pre-trained weights if provided
-    if args.epic_checkpoint:
+    # Transfer weights from EPIC pre-trained model if checkpoint provided
+    if getattr(args, 'epic_checkpoint', None):
         print("\n" + "="*80)
         print("LOADING EPIC PRE-TRAINED WEIGHTS")
         print("="*80)
-        
-        if not os.path.exists(args.epic_checkpoint):
-            raise FileNotFoundError(f"EPIC checkpoint not found: {args.epic_checkpoint}")
-        
         model = load_ukbb_model_with_epic_weights(
             ukbb_model=model,
             epic_checkpoint_path=args.epic_checkpoint,
             freeze_conv=bool(args.freeze_conv_layers),
-            freeze_mamba=bool(args.freeze_mamba_layers)
+            freeze_transformer=bool(args.freeze_transformer_layers)
         )
-    else:
-        print("No EPIC checkpoint provided. Training from random initialization.")
-    
+
     with open(os.path.join(experiment_dir, 'model_architecture.txt'), 'w') as file:
         file.write(str(model))
     print(model)
@@ -3217,49 +3953,9 @@ def main():
         dataloaders, fitted_normalizers = create_dataloaders(**dataloader_kwargs)
         print("DataLoaders created")
     
-    # ============================================================================
-    # ADD DIAGNOSTIC CODE HERE (before training)
-    # ============================================================================
-    print("\n" + "="*80)
-    print("QUICK DATA QUALITY CHECK")
-    print("="*80)
-
-    # Get first batch
-    genotypes, covariates, labels = next(iter(dataloaders['train']))
-
-    print(f"\n GENOTYPE DATA:")
-    print(f"   Shape: {genotypes.shape}")
-    print(f"   Dtype: {genotypes.dtype}")
-    print(f"   Range: [{genotypes.min():.6f}, {genotypes.max():.6f}]")
-    print(f"   Mean: {genotypes.mean():.6f}")
-    print(f"   Variance (per-SNP average): {genotypes.var(dim=0).mean():.6f}")
-    print(f"   Unique values: {len(torch.unique(genotypes))}")
-
-    if genotypes.var(dim=0).mean() < 1e-6:
-        print("    CRITICAL: Genotype variance is near zero - data is corrupted!")
-    else:
-        print("    Genotype variance looks OK")
-
-    # print(f"\n COVARIATE DATA:")
-    # print(f"   Shape: {covariates.shape}")
-    # print(f"   Range: [{covariates.min():.6f}, {covariates.max():.6f}]")
-    # print(f"   Mean: {covariates.mean():.6f}")
-
-    print(f"\n LABEL DATA:")
-    print(f"   Shape: {labels.shape}")
-    print(f"   Positive rate: {labels.mean():.4f}")
-    print(f"   Expected: ~0.50 for matched data")
-
-    if abs(labels.mean() - 0.5) > 0.1:
-        print(f"    WARNING: Label distribution is {labels.mean():.4f}, expected ~0.5")
-    else:
-        print(f"    Label distribution looks OK")
-
-    print("="*80 + "\n")
-
     # Create scheduler (after potential checkpoint loading)
     scheduler = get_scheduler(args.sch, optimizer, args, train_subjects)
-    print(f"Scheduler is: {scheduler}")
+    
     # Load scheduler state if it exists in checkpoint
     if args.resume and latest_checkpoint and 'scheduler_state_dict' in checkpoint:
         try:
@@ -3371,17 +4067,22 @@ def main():
         'Multi_Scale_Strides': str(args.multi_scale_strides) if args.use_multi_scale and args.multi_scale_mode == 'progressive' else 'N/A',
         'Hardcoded_Kernels': str(args.hardcoded_kernels) if args.use_multi_scale and args.multi_scale_mode == 'hardcoded' else 'N/A',
         'Hardcoded_Strides': str(args.hardcoded_strides) if args.use_multi_scale and args.multi_scale_mode == 'hardcoded' else 'N/A',
-        'Use_Mamba': bool(args.use_mamba),
-        'Mamba_Layers': args.mamba_layers if args.use_mamba else 'N/A',
-        'Mamba_D_Model': args.mamba_d_model if args.use_mamba else 'N/A',
-        'Mamba_D_State': args.mamba_d_state if args.use_mamba else 'N/A',
-        'Mamba_D_Conv': args.mamba_d_conv if args.use_mamba else 'N/A',
-        'Mamba_Expand': args.mamba_expand if args.use_mamba else 'N/A',
-        'Mamba_Dropout': args.mamba_dropout if args.use_mamba else 'N/A',
-        'Use_Mamba_Norm': bool(args.use_mamba_norm) if args.use_mamba else 'N/A',
-        'Use_Covariate_Tokens': bool(args.use_covariate_tokens) if args.use_mamba else 'N/A',
-        'Covariate_Embed_Dim': args.covariate_embed_dim if (args.use_mamba and args.use_covariate_tokens) else 'N/A',
-        'Pooling_Strategy': args.pooling_strategy if args.use_mamba else 'N/A',
+        'Use_Transformer': bool(args.use_transformer),
+        'Transformer_Layers': args.transformer_layers if args.use_transformer else 'N/A',
+        'Transformer_Heads': args.transformer_heads if args.use_transformer else 'N/A',
+        'Transformer_Dim': args.transformer_dim if args.use_transformer else 'N/A',
+        'Transformer_FF_Dim': args.transformer_ff_dim if args.use_transformer else 'N/A',
+        'Transformer_Dropout': args.transformer_dropout if args.use_transformer else 'N/A',
+        'Use_Positional_Encoding': bool(args.use_positional_encoding) if args.use_transformer else 'N/A',
+        'Max_Seq_Len': args.max_seq_len if args.use_transformer else 'N/A',
+        'Init_From_Pretrained': bool(args.init_from_pretrained) if args.use_transformer else 'N/A',
+        'Pretrained_Model_Name': args.pretrained_model_name if (args.use_transformer and args.init_from_pretrained) else 'N/A',
+        'Init_Layers_Fraction': args.init_layers_fraction if (args.use_transformer and args.init_from_pretrained) else 'N/A',
+        'Use_CLS_Token': bool(args.use_cls_token) if args.use_transformer else 'N/A',
+        'Use_Covariate_Tokens': bool(args.use_covariate_tokens) if args.use_transformer else 'N/A',
+        'Covariate_Token_Strategy': args.covariate_token_strategy if (args.use_transformer and args.use_covariate_tokens) else 'N/A',
+        'Covariate_Embed_Dim': args.covariate_embed_dim if (args.use_transformer and args.use_covariate_tokens) else 'N/A',
+        'Pooling_Strategy': args.pooling_strategy if args.use_transformer else 'N/A',
         'Chunked_Num_Chunks': args.chunked_num_chunks if args.pooling_strategy == 'chunked' else 'N/A',
         'Chunked_Pool_Type': args.chunked_pool_type if args.pooling_strategy == 'chunked' else 'N/A',
         'MultiScale_Window_Sizes': str(args.multiscale_window_sizes) if args.pooling_strategy == 'multiscale' else 'N/A',
