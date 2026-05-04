@@ -177,7 +177,7 @@ def parse_args():
     parser.add_argument("-freeze_transformer_layers", type=int, default=0, choices=[0, 1], help="Whether to freeze Transformer layers after EPIC transfer (0: no, 1: yes)")
 
     # Debug / fast-iteration flags
-    parser.add_argument("-debug_n_subjects", type=int, default=100, help="Limit dataset to N subjects for fast debugging (None = use all subjects)")
+    parser.add_argument("-debug_n_subjects", type=int, default=None, help="Limit dataset to N subjects for fast debugging (None = use all subjects)")
     parser.add_argument("-no_subject_cache", action="store_true", help="Force re-scan of subject files even if a cache exists")
 
     return parser.parse_args()
